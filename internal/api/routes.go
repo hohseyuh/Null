@@ -36,8 +36,7 @@ func (s *Server) Router() http.Handler {
 	r.Get("/v1/notes", s.handleListNotes)
 	r.Get("/v1/notes/*", s.handleGetNote)
 	r.Get("/v1/search", s.handleSearch)
-
-	// /v1/graph mounts here in M5.
+	r.Get("/v1/graph", s.handleGraph)
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such route")
