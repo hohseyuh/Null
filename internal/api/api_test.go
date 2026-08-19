@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"null-service/internal/search"
 	"null-service/internal/vault"
 )
 
@@ -22,11 +23,16 @@ var fixtureIndex = sync.OnceValue(func() *vault.Index {
 })
 
 func testServer() *Server {
+	searcher, err := search.New(fixtureVault)
+	if err != nil {
+		panic(err)
+	}
 	return &Server{
 		Token:        "secret",
 		MaxBodyBytes: 200_000,
 		VaultRoot:    fixtureVault,
 		Index:        fixtureIndex(),
+		Search:       searcher,
 		Log:          slog.New(slog.DiscardHandler),
 	}
 }

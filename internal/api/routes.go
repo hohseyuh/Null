@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"null-service/internal/search"
 	"null-service/internal/vault"
 )
 
@@ -19,6 +20,7 @@ type Server struct {
 	MaxBodyBytes int64
 	VaultRoot    string
 	Index        *vault.Index
+	Search       *search.Searcher
 	Log          *slog.Logger
 }
 
@@ -33,8 +35,9 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/v1/notes", s.handleListNotes)
 	r.Get("/v1/notes/*", s.handleGetNote)
+	r.Get("/v1/search", s.handleSearch)
 
-	// /v1/search and /v1/graph mount here in M4–M5.
+	// /v1/graph mounts here in M5.
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such route")
