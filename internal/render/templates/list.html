@@ -1,0 +1,19 @@
+{{template "head" .}}
+<h1>{{.Count}} notes</h1>
+{{range .Groups}}
+<section class="folder">
+  <h2>{{if .Folder}}{{.Folder}}{{else}}/{{end}}</h2>
+  <ul class="notelist">
+    {{range .Notes}}
+    <li>
+      <a href="{{noteURL .Path}}">{{.Title}}</a>
+      <span class="meta">
+        {{range .Tags}}<span class="tag">{{.}}</span>{{end}}
+        <time datetime="{{.UpdatedAt}}">{{date .UpdatedAt}}</time>
+      </span>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+{{template "foot"}}

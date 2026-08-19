@@ -1,0 +1,155 @@
+/* Null — one stylesheet, dark by default, no framework. */
+
+:root {
+  --bg: #14161a;
+  --bg-raised: #1c1f25;
+  --fg: #c9cdd3;
+  --fg-dim: #8a919c;
+  --accent: #7aa2f7;
+  --accent-dim: #4a6191;
+  --dead: #b3616a;
+  --mark: #d7ba7d;
+  --border: #2a2e36;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 70ch;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+/* header */
+header.site {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+header.site nav {
+  max-width: 70ch;
+  margin: 0 auto;
+  padding: 0.6rem 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--fg);
+  text-decoration: none;
+}
+.searchbox { margin-left: auto; }
+.searchbox input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg);
+  padding: 0.3rem 0.6rem;
+  font: inherit;
+  font-size: 0.9rem;
+  width: 14rem;
+}
+.searchbox input:focus { outline: 1px solid var(--accent-dim); }
+
+/* typography */
+h1, h2, h3, h4 { line-height: 1.25; color: #e4e7ec; }
+h1 { font-size: 1.6rem; }
+h2 { font-size: 1.25rem; margin-top: 2.2rem; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre {
+  font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace;
+  font-size: 0.92em;
+}
+pre {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.8rem 1rem;
+  overflow-x: auto;
+}
+code { background: var(--bg-raised); padding: 0.1em 0.35em; border-radius: 4px; }
+pre code { background: none; padding: 0; }
+blockquote {
+  margin: 0.6rem 0 0.6rem 0;
+  padding: 0.1rem 0 0.1rem 1rem;
+  border-left: 3px solid var(--accent-dim);
+  color: var(--fg-dim);
+}
+table { border-collapse: collapse; }
+th, td { border: 1px solid var(--border); padding: 0.3rem 0.7rem; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+img { max-width: 100%; }
+
+/* wikilinks */
+a.wikilink { border-bottom: 1px dotted var(--accent-dim); }
+.dead-link {
+  color: var(--dead);
+  border-bottom: 1px dashed var(--dead);
+  cursor: not-allowed;
+}
+
+/* list page */
+.folder h2 {
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+ul.notelist { list-style: none; margin: 0; padding: 0; }
+ul.notelist li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.8rem;
+  padding: 0.25rem 0;
+}
+ul.notelist .meta { margin-left: auto; color: var(--fg-dim); font-size: 0.82rem; white-space: nowrap; }
+.tag {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.55rem;
+  margin-right: 0.3rem;
+  font-size: 0.75rem;
+}
+
+/* note page */
+.notehead .path { color: var(--fg-dim); font-size: 0.85rem; margin: 0 0 0.4rem; }
+dl.frontmatter {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 1.2rem;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.7rem 1rem;
+  font-size: 0.88rem;
+  margin: 0 0 1.5rem;
+}
+dl.frontmatter div { display: contents; }
+dl.frontmatter dt { color: var(--fg-dim); }
+dl.frontmatter dd { margin: 0; }
+
+.backlinks { margin-top: 3rem; border-top: 1px solid var(--border); padding-top: 1rem; }
+.backlinks h2 { font-size: 0.9rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.1em; }
+.backlinks ul { list-style: none; padding: 0; }
+.backlinks blockquote { font-size: 0.9rem; margin-top: 0.2rem; }
+
+/* search page */
+ul.results { list-style: none; padding: 0; }
+ul.results li { margin-bottom: 1.4rem; }
+ul.results .path { color: var(--fg-dim); font-size: 0.82rem; margin-left: 0.5rem; }
+.snippet { margin: 0.3rem 0 0; color: var(--fg-dim); font-size: 0.92rem; }
+mark { background: var(--mark); color: #14161a; border-radius: 2px; padding: 0 0.15em; }
+.empty { color: var(--fg-dim); }
+time { font-variant-numeric: tabular-nums; }

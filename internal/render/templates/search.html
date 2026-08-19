@@ -1,0 +1,15 @@
+{{template "head" .}}
+<h1>search{{if .Query}}: {{.Query}}{{end}}</h1>
+{{if .Hits}}
+<ul class="results">
+  {{range .Hits}}
+  <li>
+    <a href="{{noteURL .Path}}">{{.Title}}</a> <span class="path">{{.Path}}</span>
+    {{range .Snippets}}<p class="snippet">{{.}}</p>{{end}}
+  </li>
+  {{end}}
+</ul>
+{{else if .Query}}
+<p class="empty">Nothing matches.</p>
+{{end}}
+{{template "foot"}}

@@ -1,0 +1,28 @@
+{{template "head" .}}
+<article>
+  <header class="notehead">
+    <p class="path">{{.Note.Path}}</p>
+    {{if .Frontmatter}}
+    <dl class="frontmatter">
+      {{range .Frontmatter}}<div><dt>{{.Key}}</dt><dd>{{.Value}}</dd></div>{{end}}
+    </dl>
+    {{end}}
+  </header>
+  <div class="body">
+    {{.Body}}
+  </div>
+  {{if .Backlinks}}
+  <footer class="backlinks">
+    <h2>Linked from</h2>
+    <ul>
+      {{range .Backlinks}}
+      <li>
+        <a href="{{noteURL .From}}">{{.From}}</a>
+        <blockquote>{{.Context}}</blockquote>
+      </li>
+      {{end}}
+    </ul>
+  </footer>
+  {{end}}
+</article>
+{{template "foot"}}

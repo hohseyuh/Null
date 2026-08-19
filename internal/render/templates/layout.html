@@ -1,0 +1,25 @@
+{{define "head"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — Null</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="site">
+  <nav>
+    <a href="/" class="brand">Null</a>
+    <form action="/s" method="get" class="searchbox">
+      <input type="search" name="q" placeholder="search…" value="{{if .Query}}{{.Query}}{{end}}">
+    </form>
+  </nav>
+</header>
+<main>
+{{end}}
+
+{{define "foot"}}
+</main>
+</body>
+</html>
+{{end}}

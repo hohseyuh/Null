@@ -13,14 +13,22 @@ import (
 	"null-service/internal/vault"
 )
 
+// Renderer mounts the HTML routes onto the shared router. Satisfied by
+// *render.Renderer; an interface here keeps api from importing render.
+type Renderer interface {
+	Mount(r chi.Router)
+}
+
 // Server wires the HTTP layer to its dependencies. All fields must be set
-// before Router is called; none may change afterwards.
+// before Router is called; none may change afterwards. Renderer may be nil
+// (API only).
 type Server struct {
 	Token        string
 	MaxBodyBytes int64
 	VaultRoot    string
 	Index        *vault.Index
 	Search       *search.Searcher
+	Renderer     Renderer
 	Log          *slog.Logger
 }
 
@@ -29,18 +37,25 @@ type Server struct {
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(s.requestLogger)
-	r.Use(s.requireBearer) // exempts /v1/health internally
 
-	r.Get("/v1/health", s.handleHealth)
+	r.Group(func(v chi.Router) {
+		v.Use(s.requireBearer) // exempts /v1/health internally
 
-	r.Get("/v1/notes", s.handleListNotes)
-	r.Get("/v1/notes/*", s.handleGetNote)
-	r.Get("/v1/search", s.handleSearch)
-	r.Get("/v1/graph", s.handleGraph)
-
-	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
-		writeError(w, http.StatusNotFound, "not_found", "no such route")
+		v.Get("/v1/health", s.handleHealth)
+		v.Get("/v1/notes", s.handleListNotes)
+		v.Get("/v1/notes/*", s.handleGetNote)
+		v.Get("/v1/search", s.handleSearch)
+		v.Get("/v1/graph", s.handleGraph)
 	})
+
+	if s.Renderer != nil {
+		s.Renderer.Mount(r)
+	}
+
+	// Unknown routes reveal nothing without a token: 401 first, 404 after.
+	r.NotFound(s.requireBearer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeError(w, http.StatusNotFound, "not_found", "no such route")
+	})).ServeHTTP)
 	return r
 }
 

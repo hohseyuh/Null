@@ -35,6 +35,7 @@ type Index struct {
 	mu        sync.RWMutex
 	notes     map[string]*Note
 	backlinks map[string][]Edge // key: To path
+	resolver  *Resolver         // rebuilt with the backlink map
 
 	reparses atomic.Int64
 }
@@ -154,6 +155,7 @@ func (ix *Index) rebuildResolutionLocked() {
 		paths = append(paths, p)
 	}
 	r := NewResolver(paths)
+	ix.resolver = r
 
 	backlinks := make(map[string][]Edge)
 	for p, n := range ix.notes {
@@ -282,6 +284,18 @@ func (ix *Index) Outlinks(rel string) []Edge {
 		out = append(out, Edge{From: rel, To: l.Path, Context: l.Context, Line: l.Line})
 	}
 	return out
+}
+
+// Resolve maps a wikilink target to an indexed path using the resolver
+// built at the last index rebuild. The renderer uses this to rewrite
+// wikilinks without maintaining a second parse.
+func (ix *Index) Resolve(target string) (string, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	if ix.resolver == nil {
+		return "", false
+	}
+	return ix.resolver.Resolve(target)
 }
 
 // Len returns the number of indexed notes.

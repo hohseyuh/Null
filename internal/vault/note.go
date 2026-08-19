@@ -238,6 +238,31 @@ func (n *Note) Section(name string) (string, bool) {
 	return "", false
 }
 
+// ReplaceWikilinks rewrites every wikilink occurrence in body through
+// repl, which receives the parsed link (Target, Section, Alias only) and
+// returns its replacement text. Occurrences repl cannot improve are
+// returned unchanged by passing back l.Context, which here carries the
+// original matched text rather than a whole line. It assumes the same
+// syntax extractWikilinks indexes, so what the renderer rewrites is
+// exactly what the graph sees.
+func ReplaceWikilinks(body string, repl func(l Link) string) string {
+	return wikilinkRe.ReplaceAllStringFunc(body, func(m string) string {
+		inner := strings.TrimSuffix(strings.TrimPrefix(m, "[["), "]]")
+		var alias, section string
+		if t, a, ok := strings.Cut(inner, "|"); ok {
+			inner, alias = t, strings.TrimSpace(a)
+		}
+		if t, s, ok := strings.Cut(inner, "#"); ok {
+			inner, section = t, strings.TrimSpace(s)
+		}
+		target := strings.TrimSpace(inner)
+		if target == "" {
+			return m
+		}
+		return repl(Link{Target: target, Section: section, Alias: alias, Context: m})
+	})
+}
+
 // Resolver maps wikilink targets to vault paths: exact path match first,
 // then unique-enough basename match (ties broken lexicographically for
 // determinism), else unresolved. It assumes the path list is the complete
