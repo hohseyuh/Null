@@ -1,0 +1,15 @@
+services:
+  nullapi:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080" # keep it loopback; TLS terminates in the reverse proxy
+    environment:
+      NULL_VAULT_PATH: /vault
+      NULL_TOKEN: ${NULL_TOKEN:?set NULL_TOKEN in .env}
+      NULL_ADDR: ":8080"
+      # NULL_MAX_BODY_BYTES: "200000"
+    volumes:
+      # read-only mount is deliberate — verify with: mount | grep vault
+      - ${VAULT_PATH:?set VAULT_PATH in .env}:/vault:ro
+    read_only: true

@@ -114,11 +114,11 @@ func TestParse(t *testing.T) {
 			bodyContains: "əvvəl-axır",
 		},
 		{
-			path:        "malformed.md",
-			title:       "malformed",
-			frontmatter: map[string]any{}, // malformed YAML degrades, never fails
-			bodyLine:    5,
-			headings:    []Heading{{Text: "malformed", Level: 1, Line: 6}},
+			path:         "malformed.md",
+			title:        "malformed",
+			frontmatter:  map[string]any{}, // malformed YAML degrades, never fails
+			bodyLine:     5,
+			headings:     []Heading{{Text: "malformed", Level: 1, Line: 6}},
 			bodyContains: "Body survives",
 		},
 	}

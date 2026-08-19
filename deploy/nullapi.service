@@ -1,0 +1,30 @@
+# systemd unit for running nullapi without Docker.
+#   install: cp deploy/nullapi.service /etc/systemd/system/
+#   config:  systemctl edit nullapi   (override the Environment lines)
+#   run:     systemctl enable --now nullapi
+[Unit]
+Description=Null read-only vault API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nullapi
+Environment=NULL_VAULT_PATH=/srv/null-vault
+Environment=NULL_ADDR=127.0.0.1:8080
+# Put NULL_TOKEN in a root-owned file instead of the unit:
+EnvironmentFile=/etc/nullapi/env
+Restart=on-failure
+RestartSec=2
+
+# Hardening: the service cannot write anywhere it doesn't own,
+# and the vault is explicitly read-only even if the code regressed.
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/srv/null-vault
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
