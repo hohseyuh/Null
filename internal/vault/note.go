@@ -211,6 +211,33 @@ func extractWikilinks(body []byte, lineOffset int) []Link {
 	return out
 }
 
+// Section returns the slice of Body from the heading whose text exactly
+// matches name, down to the next heading of the same or higher level
+// (exclusive), or to the end of the note. The second return is false when
+// no heading matches. It assumes Headings is in document order, which the
+// AST walk guarantees.
+func (n *Note) Section(name string) (string, bool) {
+	for i, h := range n.Headings {
+		if h.Text != name {
+			continue
+		}
+		lines := strings.Split(n.Body, "\n")
+		start := h.Line - n.BodyLine // 0-based index into body lines
+		end := len(lines)
+		for _, next := range n.Headings[i+1:] {
+			if next.Level <= h.Level {
+				end = next.Line - n.BodyLine
+				break
+			}
+		}
+		if start < 0 || start >= len(lines) || end < start {
+			return "", false // heading data out of sync with body; treat as absent
+		}
+		return strings.Join(lines[start:end], "\n"), true
+	}
+	return "", false
+}
+
 // Resolver maps wikilink targets to vault paths: exact path match first,
 // then unique-enough basename match (ties broken lexicographically for
 // determinism), else unresolved. It assumes the path list is the complete

@@ -5,14 +5,28 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+
+	"null-service/internal/vault"
 )
+
+const fixtureVault = "../../testdata/vault"
+
+var fixtureIndex = sync.OnceValue(func() *vault.Index {
+	ix := vault.NewIndex(fixtureVault, slog.New(slog.DiscardHandler))
+	if err := ix.Build(); err != nil {
+		panic(err)
+	}
+	return ix
+})
 
 func testServer() *Server {
 	return &Server{
 		Token:        "secret",
 		MaxBodyBytes: 200_000,
-		NotesIndexed: func() int { return 3 },
+		VaultRoot:    fixtureVault,
+		Index:        fixtureIndex(),
 		Log:          slog.New(slog.DiscardHandler),
 	}
 }
@@ -32,8 +46,8 @@ func TestHealth(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if body.Status != "ok" || body.NotesIndexed != 3 {
-		t.Fatalf("body = %+v, want status=ok notes_indexed=3", body)
+	if body.Status != "ok" || body.NotesIndexed != 6 {
+		t.Fatalf("body = %+v, want status=ok notes_indexed=6", body)
 	}
 }
 

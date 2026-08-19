@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+func testLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
+
 func buildFixtureIndex(t *testing.T) *Index {
 	t.Helper()
 	ix := NewIndex(fixtureVault, slog.New(slog.DiscardHandler))

@@ -64,14 +64,23 @@ func isHidden(rel string) bool {
 
 // readNoteFile reads one file strictly O_RDONLY — the non-negotiable
 // enforcement that this service can never write to the vault — and returns
-// its bytes and mtime. abs must already be a validated path under root.
+// its bytes and mtime. Symlinks and other irregular files are refused, so
+// a link planted inside the vault cannot pull outside content into the
+// index. abs must already be a validated path under root.
 func readNoteFile(abs string) ([]byte, time.Time, error) {
+	st, err := os.Lstat(abs)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, time.Time{}, fmt.Errorf("%s: not a regular file", abs)
+	}
 	f, err := os.OpenFile(abs, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, time.Time{}, err
 	}
 	defer f.Close()
-	st, err := f.Stat()
+	st, err = f.Stat()
 	if err != nil {
 		return nil, time.Time{}, err
 	}

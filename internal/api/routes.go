@@ -8,6 +8,8 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+
+	"null-service/internal/vault"
 )
 
 // Server wires the HTTP layer to its dependencies. All fields must be set
@@ -15,7 +17,8 @@ import (
 type Server struct {
 	Token        string
 	MaxBodyBytes int64
-	NotesIndexed func() int
+	VaultRoot    string
+	Index        *vault.Index
 	Log          *slog.Logger
 }
 
@@ -28,7 +31,10 @@ func (s *Server) Router() http.Handler {
 
 	r.Get("/v1/health", s.handleHealth)
 
-	// /v1/notes, /v1/search, /v1/graph mount here in M3–M5.
+	r.Get("/v1/notes", s.handleListNotes)
+	r.Get("/v1/notes/*", s.handleGetNote)
+
+	// /v1/search and /v1/graph mount here in M4–M5.
 
 	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no such route")
@@ -39,6 +45,6 @@ func (s *Server) Router() http.Handler {
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":        "ok",
-		"notes_indexed": s.NotesIndexed(),
+		"notes_indexed": s.Index.Len(),
 	})
 }
