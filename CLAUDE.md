@@ -80,6 +80,7 @@ internal/mcp/             MCP tools over the same in-memory index — a second
   server.go                wires Tools to SDK tool handlers + descriptions
   inspector.go             dev-only HTTP page for manual tool calls, opt-in via env
   http.go                  Streamable HTTP transport, bearer-token gated, opt-in via env
+  oauth.go                 minimal OAuth 2.1 + DCR for spec-compliant remote clients (Claude.ai)
 spec/                     the specs below — read before implementing
 ```
 

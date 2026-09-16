@@ -126,17 +126,31 @@ that spawns the binary.
 For a client that can't spawn a local subprocess, set `NULL_MCP_HTTP_ADDR`
 to switch to the Streamable HTTP transport instead of stdio — never both
 in the same process; see `spec/null-mcp-v0.md`'s "HTTP transport" section
-for why. `NULL_TOKEN` is then required, checked on every request:
+for why. `NULL_TOKEN` and `NULL_MCP_PUBLIC_URL` (this server's own public
+HTTPS origin — needed for OAuth discovery, see below) are then required:
 
 ```sh
 NULL_VAULT_PATH=/srv/null-vault NULL_MCP_HTTP_ADDR=127.0.0.1:8092 \
-  NULL_TOKEN=$(openssl rand -hex 32) go run ./cmd/nullmcp
+  NULL_TOKEN=$(openssl rand -hex 32) \
+  NULL_MCP_PUBLIC_URL=https://your-host:10000 go run ./cmd/nullmcp
 ```
 
-Give the remote client `https://your-host/mcp` with `Authorization: Bearer
-<token>` — this process only ever binds loopback; a reverse proxy (this
-repo's own deployment uses Tailscale Funnel) is what makes it reachable
-from anywhere else, and terminates TLS. This binary never does.
+Two ways to authenticate against `https://your-host:10000/mcp`, both
+described in full in `spec/null-mcp-v0.md`'s OAuth section:
+
+- **A plain client** (curl, testing, anything that doesn't need OAuth):
+  `Authorization: Bearer <NULL_TOKEN>`, directly.
+- **Claude.ai's connector settings**, or any MCP-authorization-spec-
+  compliant client: it self-registers and discovers the flow on its own
+  (`.well-known/oauth-protected-resource` → `.well-known/oauth-
+  authorization-server` → `/register` → `/authorize` → `/token`) — just
+  give it the `/mcp` URL. The one thing you'll do by hand is type
+  `NULL_TOKEN` into the `/authorize` page's form once, in the browser,
+  when the client opens it.
+
+This process only ever binds loopback; a reverse proxy (this repo's own
+deployment uses Tailscale Funnel) is what makes it reachable from
+anywhere else, and terminates TLS. This binary never does.
 
 To poke at the tools by hand during development, set
 `NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090` and open that address — a

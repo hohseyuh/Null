@@ -40,6 +40,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,6 +58,7 @@ type config struct {
 	inspectorAddr string // empty disables the inspector
 	httpAddr      string // empty means stdio transport; set means HTTP-only, see package doc
 	token         string // required iff httpAddr is set
+	publicURL     string // required iff httpAddr is set; this server's own public https origin
 }
 
 // loadConfig reads configuration from the environment. It assumes it is
@@ -70,6 +72,7 @@ func loadConfig() (config, error) {
 		inspectorAddr: os.Getenv("NULL_MCP_INSPECTOR_ADDR"),
 		httpAddr:      os.Getenv("NULL_MCP_HTTP_ADDR"),
 		token:         os.Getenv("NULL_TOKEN"),
+		publicURL:     strings.TrimSuffix(os.Getenv("NULL_MCP_PUBLIC_URL"), "/"),
 	}
 	if cfg.vaultPath == "" {
 		return cfg, errors.New("NULL_VAULT_PATH is required")
@@ -96,8 +99,18 @@ func loadConfig() (config, error) {
 		}
 		cfg.maxBodyBytes = n
 	}
-	if cfg.httpAddr != "" && cfg.token == "" {
-		return cfg, errors.New("NULL_TOKEN is required when NULL_MCP_HTTP_ADDR is set")
+	if cfg.httpAddr != "" {
+		if cfg.token == "" {
+			return cfg, errors.New("NULL_TOKEN is required when NULL_MCP_HTTP_ADDR is set")
+		}
+		if cfg.publicURL == "" {
+			return cfg, errors.New("NULL_MCP_PUBLIC_URL is required when NULL_MCP_HTTP_ADDR is set " +
+				"(the public https origin a reverse proxy exposes this on, e.g. https://host:10000 — " +
+				"needed for OAuth discovery metadata; see spec/null-mcp-v0.md)")
+		}
+		if !strings.HasPrefix(cfg.publicURL, "https://") && !strings.HasPrefix(cfg.publicURL, "http://localhost") {
+			return cfg, fmt.Errorf("NULL_MCP_PUBLIC_URL: %q must be https:// (or http://localhost for local dev)", cfg.publicURL)
+		}
 	}
 	return cfg, nil
 }
@@ -197,7 +210,12 @@ func run(log *slog.Logger) error {
 	log.Info("mcp server starting", "vault", cfg.vaultPath, "notes", index.Len())
 
 	if cfg.httpAddr != "" {
-		return runHTTPTransport(ctx, server, cfg.httpAddr, cfg.token, log)
+		oauth, err := nullmcp.NewOAuthServer(cfg.publicURL, cfg.token)
+		if err != nil {
+			return err
+		}
+		go sweepOAuthPeriodically(ctx, oauth)
+		return runHTTPTransport(ctx, server, oauth, cfg.httpAddr, cfg.token, log)
 	}
 	if err := server.Run(ctx, &sdkmcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("mcp server: %w", err)
@@ -212,10 +230,10 @@ func run(log *slog.Logger) error {
 // is active. addr should be a loopback address; a reverse proxy (see
 // the package doc) is what makes it reachable from anywhere else, and
 // is also what terminates TLS — this process never does.
-func runHTTPTransport(ctx context.Context, server *sdkmcp.Server, addr, token string, log *slog.Logger) error {
+func runHTTPTransport(ctx context.Context, server *sdkmcp.Server, oauth *nullmcp.OAuthServer, addr, token string, log *slog.Logger) error {
 	httpSrv := &http.Server{
 		Addr:              addr,
-		Handler:           nullmcp.NewHTTPHandler(server, token, log),
+		Handler:           nullmcp.NewHTTPHandler(server, oauth, token, log),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -240,6 +258,23 @@ func runHTTPTransport(ctx context.Context, server *sdkmcp.Server, addr, token st
 		return fmt.Errorf("mcp http shutdown: %w", err)
 	}
 	return nil
+}
+
+// sweepOAuthPeriodically evicts expired codes/tokens from oauth every
+// few minutes until ctx is cancelled. Purely memory hygiene on a
+// long-running process — every lookup path also checks expiry itself,
+// so correctness never depends on this running.
+func sweepOAuthPeriodically(ctx context.Context, oauth *nullmcp.OAuthServer) {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			oauth.Sweep()
+		}
+	}
 }
 
 // startInspector wires the dev-only tool inspector to its own HTTP

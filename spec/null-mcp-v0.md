@@ -261,12 +261,71 @@ backgrounded without a client on stdin: it exited within milliseconds.
 The fix is architectural, not defensive code — HTTP mode never touches
 `&sdkmcp.StdioTransport{}` at all.
 
-**Auth is mandatory the moment this mode is on**, not optional: every
-request to `/mcp` needs `Authorization: Bearer <token>`, checked with the
-same constant-time SHA-256 compare `internal/api/auth.go` uses.
-`loadConfig` refuses to boot with `NULL_MCP_HTTP_ADDR` set and no
-`NULL_TOKEN` — this is enforced at startup, not left as a runtime
-possibility.
+**Auth is mandatory the moment this mode is on**, not optional. `/mcp`
+accepts either the raw `NULL_TOKEN` as a bearer header (constant-time
+compare, same discipline `internal/api/auth.go` uses — fine for curl,
+testing, or any client that doesn't need the dance below) or a valid
+OAuth access token (see "OAuth" below). `loadConfig` refuses to boot
+with `NULL_MCP_HTTP_ADDR` set and no `NULL_TOKEN` or `NULL_MCP_PUBLIC_URL`
+— enforced at startup, not left as a runtime possibility.
+
+### OAuth
+
+`internal/mcp/oauth.go`. The MCP authorization spec — which Claude.ai's
+connector UI requires, specifically — expects a real OAuth 2.1 flow with
+Dynamic Client Registration, not a header a human pastes in. This is
+that flow, implemented to exactly the extent the spec requires and no
+further: RFC 9728 (protected resource metadata), RFC 8414 (authorization
+server metadata), RFC 7591 (dynamic client registration), RFC 8707
+(resource indicators / audience binding), PKCE (S256 only — "plain" is
+not accepted), single-use authorization codes, rotated refresh tokens.
+
+There is exactly one real credential anywhere in this flow: `NULL_TOKEN`,
+the same one `/mcp` already accepted directly. OAuth here is a protocol
+envelope around that one secret, not a user system — "no users, no
+roles, one human uses this" is still true. The `/authorize` step is a
+single password-style form (`internal/mcp/oauth.go`'s embedded HTML)
+that checks the submitted value against `NULL_TOKEN`, constant-time,
+same as everywhere else. There is no separate OAuth client
+ID/secret to configure by hand — a compliant client (Claude.ai included)
+self-registers via DCR and discovers everything else from the metadata
+endpoints.
+
+**Endpoints**, all under the same `NULL_MCP_PUBLIC_URL` base:
+
+| path | method | purpose |
+|---|---|---|
+| `/.well-known/oauth-protected-resource` | GET | names the authorization server (RFC 9728) |
+| `/.well-known/oauth-authorization-server` | GET | authorization server metadata (RFC 8414) |
+| `/register` | POST | dynamic client registration (RFC 7591) |
+| `/authorize` | GET, POST | the credential check; GET shows the form, POST checks it |
+| `/token` | POST | `authorization_code` and `refresh_token` grants |
+
+**Security properties actually verified, not just claimed** (see
+`internal/mcp/oauth_test.go`'s `TestOAuthFullFlow` and friends, plus a
+live curl-driven run of the whole flow against a real running process
+during development):
+- PKCE is mandatory — `/authorize` without `code_challenge`/S256 is
+  rejected before a credential is even asked for.
+- `redirect_uri` must exactly match one registered via DCR — a mismatch
+  fails *in place*, never redirects anywhere. Redirecting on that
+  specific failure is the open-redirect vulnerability the spec calls out
+  by name; this deliberately does not do that.
+- Authorization codes are single-use (deleted on first exchange attempt,
+  success or failure) and short-lived (5 min).
+- The `resource` parameter is validated at both `/authorize` and
+  `/token` against this server's own canonical resource URI
+  (`NULL_MCP_PUBLIC_URL` + `/mcp`) — a token can't be requested for, or
+  used against, a different resource.
+- Refresh tokens rotate: each use invalidates the old one and issues a
+  new one, so a stolen-then-reused refresh token is a detectable replay,
+  not a silent one.
+
+**`NULL_MCP_PUBLIC_URL`** must be this server's own public HTTPS origin
+(e.g. `https://host:10000`, no trailing slash) — every URL in the
+metadata documents, and the resource identifier tokens are bound to, is
+derived from it. Wrong value, and discovery or audience validation
+breaks for every client, not just misbehaves quietly.
 
 **`DisableLocalhostProtection: true`** is set on the SDK's DNS-rebinding
 guard. This handler is designed to sit behind a local reverse proxy

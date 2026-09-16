@@ -10,16 +10,28 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func testHTTPServer(t *testing.T) *httptest.Server {
+// testHTTPServer wires a real httptest.Server, but the OAuthServer
+// inside it needs to know its own public base URL before it exists —
+// chicken-and-egg, solved by building the mux by hand around a
+// placeholder and swapping the base URL in after httptest assigns a
+// port. Tests that only exercise /mcp directly (bearer auth) don't need
+// this; TestOAuthFullFlow below does, and builds its own server instead.
+func testHTTPServer(t *testing.T) (*httptest.Server, *OAuthServer) {
 	t.Helper()
 	srv := testServer(t) // from server_test.go: fixture vault, no inbox
-	ts := httptest.NewServer(NewHTTPHandler(srv, "secret", nil))
+	oauth, err := NewOAuthServer("http://placeholder", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(NewHTTPHandler(srv, oauth, "secret", nil))
 	t.Cleanup(ts.Close)
-	return ts
+	oauth.baseURL = ts.URL
+	oauth.resource = ts.URL + HTTPPath
+	return ts, oauth
 }
 
 func TestHTTPRequiresBearer(t *testing.T) {
-	ts := testHTTPServer(t)
+	ts, _ := testHTTPServer(t)
 
 	tests := []struct {
 		name   string
@@ -50,8 +62,23 @@ func TestHTTPRequiresBearer(t *testing.T) {
 	}
 }
 
+func TestHTTPUnauthorizedCarriesWWWAuthenticate(t *testing.T) {
+	ts, oauth := testHTTPServer(t)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+HTTPPath, strings.NewReader("{}"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got := resp.Header.Get("WWW-Authenticate")
+	want := `Bearer resource_metadata="` + oauth.baseURL + `/.well-known/oauth-protected-resource"`
+	if got != want {
+		t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
+	}
+}
+
 func TestHTTPHealthzNeedsNoAuth(t *testing.T) {
-	ts := testHTTPServer(t)
+	ts, _ := testHTTPServer(t)
 	resp, err := http.Get(ts.URL + "/healthz")
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +93,7 @@ func TestHTTPHealthzNeedsNoAuth(t *testing.T) {
 // MCP client, over real HTTP, through the bearer-auth wrapper, calling a
 // real tool — not just that individual pieces are individually correct.
 func TestHTTPFullMCPRoundTrip(t *testing.T) {
-	ts := testHTTPServer(t)
+	ts, _ := testHTTPServer(t)
 
 	transport := &sdkmcp.StreamableClientTransport{
 		Endpoint: ts.URL + HTTPPath,
