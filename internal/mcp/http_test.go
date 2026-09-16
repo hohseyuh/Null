@@ -18,7 +18,7 @@ import (
 // this; TestOAuthFullFlow below does, and builds its own server instead.
 func testHTTPServer(t *testing.T) (*httptest.Server, *OAuthServer) {
 	t.Helper()
-	srv := testServer(t) // from server_test.go: fixture vault, no inbox
+	srv := testServer(t) // from server_test.go: read-only fixture vault
 	oauth, err := NewOAuthServer("http://placeholder", "secret")
 	if err != nil {
 		t.Fatal(err)

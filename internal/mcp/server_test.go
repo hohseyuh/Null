@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -13,6 +14,9 @@ import (
 	"null-service/internal/vault"
 )
 
+// testServer builds a server over the read-only fixture vault — fine
+// for every read-tool test; never call a write tool against it (see
+// gitVaultServer).
 func testServer(t *testing.T) *sdkmcp.Server {
 	t.Helper()
 	log := slog.New(slog.DiscardHandler)
@@ -24,45 +28,32 @@ func testServer(t *testing.T) *sdkmcp.Server {
 	if err != nil {
 		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
 	}
-	return NewServer(&Tools{
-		Index: ix, VaultIndex: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log,
-	})
+	return NewServer(&Tools{Index: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log})
 }
 
-// testServerWithInbox is testServer plus a fresh, empty temp-dir inbox —
-// for exercising create_note/write_note and inbox visibility over a real
-// protocol round trip.
-func testServerWithInbox(t *testing.T) (*sdkmcp.Server, string) {
+// gitVaultServer builds a server over a git-initialized copy of the
+// fixture vault, for tests that call create_note/write_note/delete_note/
+// push_vault over a real protocol round trip.
+func gitVaultServer(t *testing.T) (*sdkmcp.Server, string) {
 	t.Helper()
+	root := t.TempDir()
+	if out, err := exec.Command("cp", "-r", fixtureVault+"/.", root).CombinedOutput(); err != nil {
+		t.Fatalf("cp fixture vault: %v: %s", err, out)
+	}
+	runTestGit(t, root, "init", "-q")
+	runTestGit(t, root, "add", "-A")
+	runTestGit(t, root, "commit", "-q", "-m", "seed")
+
 	log := slog.New(slog.DiscardHandler)
-
-	primary := vault.NewIndex(fixtureVault, log)
-	if err := primary.Build(); err != nil {
+	ix := vault.NewIndex(root, log)
+	if err := ix.Build(); err != nil {
 		t.Fatal(err)
 	}
-	se, err := search.New(fixtureVault)
+	se, err := search.New(root)
 	if err != nil {
-		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
+		t.Fatalf("search.New: %v", err)
 	}
-
-	inboxRoot := t.TempDir()
-	inboxIx := vault.NewIndex(inboxRoot, log)
-	inboxIx.Source = vault.SourceInbox
-	if err := inboxIx.Build(); err != nil {
-		t.Fatal(err)
-	}
-	inboxSe, err := search.New(inboxRoot)
-	if err != nil {
-		t.Fatalf("search.New(inbox): %v", err)
-	}
-
-	combined := vault.NewCombined(primary, inboxIx, InboxPrefix)
-	server := NewServer(&Tools{
-		Index: combined, VaultIndex: primary, Search: se, InboxSearch: inboxSe,
-		VaultRoot: fixtureVault, InboxRoot: inboxRoot, InboxIndex: inboxIx,
-		MaxBodyBytes: 200_000, Log: log,
-	})
-	return server, inboxRoot
+	return NewServer(&Tools{Index: ix, Search: se, VaultRoot: root, MaxBodyBytes: 200_000, Log: log}), root
 }
 
 // connect starts server over an in-memory transport and returns a
@@ -84,7 +75,7 @@ func connect(t *testing.T, server *sdkmcp.Server) *sdkmcp.ClientSession {
 	return session
 }
 
-func TestServerAdvertisesReadToolsButNotWriteToolsWithoutInbox(t *testing.T) {
+func TestServerAdvertisesAllElevenTools(t *testing.T) {
 	session := connect(t, testServer(t))
 	res, err := session.ListTools(context.Background(), nil)
 	if err != nil {
@@ -93,12 +84,9 @@ func TestServerAdvertisesReadToolsButNotWriteToolsWithoutInbox(t *testing.T) {
 	want := map[string]bool{
 		"list_notes": false, "get_note": false, "search_notes": false, "get_graph": false,
 		"find_relatives": false, "get_links": false, "find_path": false,
-		"get_graph_vault_only": false, "find_path_vault_only": false,
+		"create_note": false, "write_note": false, "delete_note": false, "push_vault": false,
 	}
 	for _, tool := range res.Tools {
-		if tool.Name == "create_note" || tool.Name == "write_note" {
-			t.Errorf("write tool %q advertised with no inbox configured", tool.Name)
-		}
 		if _, ok := want[tool.Name]; ok {
 			want[tool.Name] = true
 		}
@@ -114,25 +102,8 @@ func TestServerAdvertisesReadToolsButNotWriteToolsWithoutInbox(t *testing.T) {
 			t.Errorf("tool %q not advertised", name)
 		}
 	}
-}
-
-func TestServerAdvertisesWriteToolsWithInbox(t *testing.T) {
-	server, _ := testServerWithInbox(t)
-	session := connect(t, server)
-	res, err := session.ListTools(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := map[string]bool{"create_note": false, "write_note": false}
-	for _, tool := range res.Tools {
-		if _, ok := found[tool.Name]; ok {
-			found[tool.Name] = true
-		}
-	}
-	for name, ok := range found {
-		if !ok {
-			t.Errorf("write tool %q not advertised with inbox configured", name)
-		}
+	if len(res.Tools) != len(want) {
+		t.Fatalf("got %d tools, want exactly %d", len(res.Tools), len(want))
 	}
 }
 
@@ -203,95 +174,85 @@ func callTool(t *testing.T, session *sdkmcp.ClientSession, name string, args map
 	return res
 }
 
-// TestServerInboxLifecycle exercises create → read (labeled) → search →
-// overwrite → guardrails, entirely through real MCP calls, over the same
-// server a client would actually talk to.
-func TestServerInboxLifecycle(t *testing.T) {
-	server, _ := testServerWithInbox(t)
+// TestServerVaultWriteLifecycle exercises create → read → search →
+// overwrite → delete → push, entirely through real MCP calls over the
+// same server a client would actually talk to — proving the whole write
+// path works end to end, not just its pieces in isolation.
+func TestServerVaultWriteLifecycle(t *testing.T) {
+	server, root := gitVaultServer(t)
 	session := connect(t, server)
-
-	// path without the inbox/ prefix is rejected before touching disk
-	if res := callTool(t, session, "create_note", map[string]any{
-		"path": "no-prefix.md", "body": "# x\n",
-	}, nil); !res.IsError {
-		t.Fatal("expected error for a create_note path missing the inbox/ prefix")
-	}
 
 	var created CreateNoteOut
 	callTool(t, session, "create_note", map[string]any{
-		"path":        "inbox/thought.md",
+		"path":        "notes/thought.md",
 		"frontmatter": map[string]any{"status": "draft"},
 		"body":        "# a passing thought\n\nsomething worth keeping, maybe\n",
+		"reason":      "capturing an idea",
 	}, &created)
-	if created.Path != "inbox/thought.md" {
+	if created.Path != "notes/thought.md" {
 		t.Fatalf("created.Path = %q", created.Path)
+	}
+
+	// each write is its own commit
+	if msg := runTestGit(t, root, "log", "-1", "--pretty=%B"); !strings.HasPrefix(msg, "Add notes/thought.md") ||
+		!strings.Contains(msg, "capturing an idea") {
+		t.Fatalf("commit message = %q", msg)
 	}
 
 	// creating at the same path again fails — no silent clobber
 	if res := callTool(t, session, "create_note", map[string]any{
-		"path": "inbox/thought.md", "body": "clobber",
+		"path": "notes/thought.md", "body": "clobber",
 	}, nil); !res.IsError {
-		t.Fatal("expected error creating over an existing inbox note")
+		t.Fatal("expected error creating over an existing note")
 	}
 
-	// get_note sees it immediately, labeled, with source "inbox"
+	// get_note sees it immediately
 	var got GetNoteOut
-	callTool(t, session, "get_note", map[string]any{"path": "inbox/thought.md"}, &got)
-	if got.Source != "inbox" {
-		t.Fatalf("Source = %q, want inbox", got.Source)
-	}
-	if !strings.Contains(got.Title, "[inbox") {
-		t.Fatalf("Title = %q, want the inbox label", got.Title)
+	callTool(t, session, "get_note", map[string]any{"path": "notes/thought.md"}, &got)
+	if !strings.Contains(got.Body, "something worth keeping") {
+		t.Fatalf("body = %q", got.Body)
 	}
 
-	// list_notes sees it too, same labeling
-	var listed ListNotesOut
-	callTool(t, session, "list_notes", map[string]any{"folder": "inbox"}, &listed)
-	if len(listed.Notes) != 1 || listed.Notes[0].Source != "inbox" {
-		t.Fatalf("listed = %+v", listed.Notes)
-	}
-
-	// search_notes finds it by body text, via the inbox's own rg process
+	// search_notes finds it by body text
 	var searched SearchNotesOut
 	callTool(t, session, "search_notes", map[string]any{"query": "passing thought"}, &searched)
-	if len(searched.Results) != 1 || searched.Results[0].Path != "inbox/thought.md" {
+	if len(searched.Results) != 1 || searched.Results[0].Path != "notes/thought.md" {
 		t.Fatalf("searched = %+v", searched.Results)
 	}
 
 	// write_note overwrites wholesale
-	var written WriteNoteOut
 	callTool(t, session, "write_note", map[string]any{
-		"path": "inbox/thought.md", "body": "# revised\n\nno longer a passing thought\n",
-	}, &written)
-	callTool(t, session, "get_note", map[string]any{"path": "inbox/thought.md"}, &got)
+		"path": "notes/thought.md", "body": "# revised\n\nno longer a passing thought\n",
+	}, nil)
+	callTool(t, session, "get_note", map[string]any{"path": "notes/thought.md"}, &got)
 	if !strings.Contains(got.Body, "no longer a passing thought") {
 		t.Fatalf("body after write = %q", got.Body)
 	}
 
 	// write_note on something that was never created fails
 	if res := callTool(t, session, "write_note", map[string]any{
-		"path": "inbox/never-created.md", "body": "x",
+		"path": "notes/never-created.md", "body": "x",
 	}, nil); !res.IsError {
 		t.Fatal("expected error writing a note that doesn't exist")
 	}
 
 	// path traversal is rejected the same as everywhere else in this codebase
 	if res := callTool(t, session, "create_note", map[string]any{
-		"path": "inbox/../../etc/passwd", "body": "x",
+		"path": "../../etc/passwd", "body": "x",
 	}, nil); !res.IsError {
 		t.Fatal("expected error for a traversal attempt")
 	}
 
-	// get_graph sees the inbox note when rooted there; get_graph_vault_only refuses it
-	var graph GetGraphOut
-	callTool(t, session, "get_graph", map[string]any{"path": "inbox/thought.md"}, &graph)
-	if graph.Root != "inbox/thought.md" {
-		t.Fatalf("get_graph root = %q", graph.Root)
+	// delete_note removes it
+	callTool(t, session, "delete_note", map[string]any{"path": "notes/thought.md", "reason": "done with it"}, nil)
+	if res := callTool(t, session, "get_note", map[string]any{"path": "notes/thought.md"}, nil); !res.IsError {
+		t.Fatal("expected error fetching a deleted note")
 	}
-	if res := callTool(t, session, "get_graph_vault_only", map[string]any{
-		"path": "inbox/thought.md",
-	}, nil); !res.IsError {
-		t.Fatal("expected get_graph_vault_only to refuse an inbox root")
+
+	// push_vault fails cleanly with no remote configured
+	res := callTool(t, session, "push_vault", map[string]any{}, nil)
+	if !res.IsError {
+		t.Fatal("expected push_vault to fail with no remote configured")
 	}
 }
 

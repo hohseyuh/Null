@@ -39,15 +39,6 @@ type Link struct {
 	Context  string `json:"context"`
 }
 
-// Source names which root an Index built a Note from. NewIndex defaults
-// every index to SourceVault, so existing single-root callers (every
-// test, every use before the inbox existed) see this field populated
-// without any change on their part.
-const (
-	SourceVault = "vault"
-	SourceInbox = "inbox"
-)
-
 // Note is one parsed markdown file. Body is the raw markdown after the
 // frontmatter block, byte-for-byte — never rendered, never rewritten.
 type Note struct {
@@ -61,10 +52,6 @@ type Note struct {
 	Outlinks    []Link
 	UpdatedAt   time.Time
 	SizeBytes   int64
-	// Source is "vault" or "inbox". Set by the owning Index, not by
-	// Parse — a single parsed file has no opinion about which root it
-	// came from.
-	Source string
 }
 
 var md = goldmark.New()

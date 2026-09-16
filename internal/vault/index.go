@@ -32,11 +32,6 @@ type Index struct {
 	root string
 	log  *slog.Logger
 
-	// Source is stamped onto every Note this index parses. Defaults to
-	// SourceVault; set directly (Index.Source = vault.SourceInbox)
-	// before Build for a secondary root such as the inbox.
-	Source string
-
 	mu        sync.RWMutex
 	notes     map[string]*Note
 	backlinks map[string][]Edge // key: To path
@@ -45,26 +40,12 @@ type Index struct {
 	reparses atomic.Int64
 }
 
-// Reader is the read surface both a plain Index and a Combined (a merged
-// vault+inbox view) satisfy. internal/mcp depends on this instead of
-// *Index directly so it can run against either.
-type Reader interface {
-	Get(path string) (*Note, bool)
-	All() []*Note
-	Backlinks(path string) []Edge
-	Outlinks(path string) []Edge
-	Graph(root string, depth int, direction string) GraphResult
-	Resolve(target string) (string, bool)
-	Len() int
-}
-
-// NewIndex creates an empty index over the vault rooted at root, sourced
-// as SourceVault. Call Build before serving. log must be non-nil.
+// NewIndex creates an empty index over the vault rooted at root. Call
+// Build before serving. log must be non-nil.
 func NewIndex(root string, log *slog.Logger) *Index {
 	return &Index{
 		root:      root,
 		log:       log,
-		Source:    SourceVault,
 		notes:     map[string]*Note{},
 		backlinks: map[string][]Edge{},
 	}
@@ -82,11 +63,11 @@ func isHidden(rel string) bool {
 	return false
 }
 
-// readNoteFile reads one file strictly O_RDONLY — the non-negotiable
-// enforcement that this service can never write to the vault — and returns
-// its bytes and mtime. Symlinks and other irregular files are refused, so
-// a link planted inside the vault cannot pull outside content into the
-// index. abs must already be a validated path under root.
+// readNoteFile reads one file strictly O_RDONLY — indexing never writes,
+// even though direct vault writes now happen elsewhere (write.go) — and
+// returns its bytes and mtime. Symlinks and other irregular files are
+// refused, so a link planted inside the vault cannot pull outside content
+// into the index. abs must already be a validated path under root.
 func readNoteFile(abs string) ([]byte, time.Time, error) {
 	st, err := os.Lstat(abs)
 	if err != nil {
@@ -144,9 +125,7 @@ func (ix *Index) Build() error {
 			ix.log.Warn("skipping unreadable note", "path", rel, "err", rerr)
 			return nil
 		}
-		n := Parse(rel, raw, mtime, ix.log)
-		n.Source = ix.Source
-		parsed[rel] = n
+		parsed[rel] = Parse(rel, raw, mtime, ix.log)
 		return nil
 	})
 	if err != nil {
@@ -241,9 +220,7 @@ func (ix *Index) applyBatch(rels []string) {
 			continue
 		}
 		ix.reparses.Add(1)
-		n := Parse(rel, raw, mtime, ix.log)
-		n.Source = ix.Source
-		batch = append(batch, parsedNote{rel, n})
+		batch = append(batch, parsedNote{rel, Parse(rel, raw, mtime, ix.log)})
 	}
 
 	ix.mu.Lock()

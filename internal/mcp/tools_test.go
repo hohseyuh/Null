@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -14,6 +15,11 @@ import (
 
 const fixtureVault = "../../testdata/vault"
 
+// testTools builds Tools directly over the committed fixture vault —
+// read-only use. Never call a write tool against this: the fixture is
+// this repo's own tracked test data, and testTools's vault isn't even a
+// git repo (CreateNote/WriteNote/DeleteNote would fail EnsureGitRepo's
+// precondition, by design — see gitVaultTools for a writable fixture).
 func testTools(t *testing.T) *Tools {
 	t.Helper()
 	log := slog.New(slog.DiscardHandler)
@@ -25,7 +31,46 @@ func testTools(t *testing.T) *Tools {
 	if err != nil {
 		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
 	}
-	return &Tools{Index: ix, VaultIndex: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log}
+	return &Tools{Index: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log}
+}
+
+// gitVaultTools copies the fixture vault into a fresh git repo (an
+// initial commit seeding its current content) and builds Tools over
+// that copy — for tests that call create_note/write_note/delete_note,
+// which now write directly to the vault and require it be a git repo.
+func gitVaultTools(t *testing.T) *Tools {
+	t.Helper()
+	root := t.TempDir()
+	if out, err := exec.Command("cp", "-r", fixtureVault+"/.", root).CombinedOutput(); err != nil {
+		t.Fatalf("cp fixture vault: %v: %s", err, out)
+	}
+	runTestGit(t, root, "init", "-q")
+	runTestGit(t, root, "add", "-A")
+	runTestGit(t, root, "commit", "-q", "-m", "seed")
+
+	log := slog.New(slog.DiscardHandler)
+	ix := vault.NewIndex(root, log)
+	if err := ix.Build(); err != nil {
+		t.Fatal(err)
+	}
+	se, err := search.New(root)
+	if err != nil {
+		t.Fatalf("search.New: %v", err)
+	}
+	return &Tools{Index: ix, Search: se, VaultRoot: root, MaxBodyBytes: 200_000, Log: log}
+}
+
+func runTestGit(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+	cmd.Env = append(cmd.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return string(out)
 }
 
 func TestListNotesMetadataOnly(t *testing.T) {
@@ -302,117 +347,128 @@ func TestFindPath(t *testing.T) {
 	}
 }
 
-// buildToolsWithInbox is testTools plus an inbox index sharing the same
-// physical directory an actual inbox would use, for testing the
-// "_vault_only" tools against a real merged Index the way nullmcp builds
-// one — not just the bare vault index testTools alone would give.
-func buildToolsWithInbox(t *testing.T, inboxFiles map[string]string) *Tools {
-	t.Helper()
-	log := slog.New(slog.DiscardHandler)
+func TestCreateWriteDeleteNoteLifecycle(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
 
-	primary := vault.NewIndex(fixtureVault, log)
-	if err := primary.Build(); err != nil {
-		t.Fatal(err)
-	}
-	se, err := search.New(fixtureVault)
-	if err != nil {
-		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
-	}
-
-	inboxRoot := t.TempDir()
-	for rel, content := range inboxFiles {
-		if err := vault.CreateNote(inboxRoot, rel, nil, content); err != nil {
-			t.Fatal(err)
-		}
-	}
-	inboxIx := vault.NewIndex(inboxRoot, log)
-	inboxIx.Source = vault.SourceInbox
-	if err := inboxIx.Build(); err != nil {
-		t.Fatal(err)
-	}
-
-	return &Tools{
-		Index: vault.NewCombined(primary, inboxIx, InboxPrefix), VaultIndex: primary,
-		Search: se, VaultRoot: fixtureVault, InboxRoot: inboxRoot, InboxIndex: inboxIx,
-		MaxBodyBytes: 200_000, Log: log,
-	}
-}
-
-func TestGetGraphVaultOnlyExcludesInbox(t *testing.T) {
-	tl := buildToolsWithInbox(t, map[string]string{
-		"draft.md": "# draft\n\nlinks to [[soul]]\n",
-	})
-
-	// the merged tool can root a graph at an inbox note
-	merged, err := tl.GetGraph(context.Background(), GetGraphIn{Path: "inbox/draft.md"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if merged.Root != "inbox/draft.md" {
-		t.Fatalf("merged root = %q", merged.Root)
-	}
-
-	// the vault-only tool refuses the same root outright
-	if _, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{Path: "inbox/draft.md"}); err == nil {
-		t.Fatal("expected error rooting a vault-only graph at an inbox note")
-	}
-
-	// and never surfaces an inbox node when rooted in the vault, even
-	// though that already held true before this tool existed (no
-	// cross-boundary edges yet) — asserted so a future change to that
-	// limitation can't silently leak inbox content in here too
-	vaultOnly, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{
-		Path: "engineering/basim/soul.md", Depth: 3,
+	created, err := tl.CreateNote(ctx, CreateNoteIn{
+		Path: "drafts/idea.md", Frontmatter: map[string]any{"status": "draft"},
+		Body: "# idea\n\nsomething worth keeping\n", Reason: "trying it out",
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("CreateNote: %v", err)
 	}
-	for _, n := range vaultOnly.Nodes {
-		if n.Source == vault.SourceInbox {
-			t.Fatalf("vault-only graph leaked an inbox node: %+v", n)
-		}
+	if created.Path != "drafts/idea.md" {
+		t.Fatalf("created.Path = %q", created.Path)
 	}
-}
 
-func TestGetGraphVaultOnlyWorksWithoutInboxConfigured(t *testing.T) {
-	tl := testTools(t) // no inbox at all
-	out, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{Path: "engineering/basim/soul.md"})
+	// immediately visible — no wait for the watcher
+	got, err := tl.GetNote(ctx, GetNoteIn{Path: "drafts/idea.md"})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("GetNote right after CreateNote: %v", err)
 	}
-	if len(out.Nodes) == 0 {
-		t.Fatal("expected a normal graph with no inbox configured")
+	if !strings.Contains(got.Body, "something worth keeping") {
+		t.Fatalf("body = %q", got.Body)
 	}
-}
 
-func TestFindPathVaultOnlyExcludesInbox(t *testing.T) {
-	tl := buildToolsWithInbox(t, map[string]string{
-		"draft.md": "# draft\n\nlinks to [[soul]]\n",
-	})
+	// each write is its own commit
+	if msg := runTestGit(t, tl.VaultRoot, "log", "-1", "--pretty=%B"); !strings.HasPrefix(msg, "Add drafts/idea.md") ||
+		!strings.Contains(msg, "trying it out") || !strings.Contains(msg, "Source: nullmcp create_note") {
+		t.Fatalf("commit message = %q", msg)
+	}
 
-	// the merged tool accepts an inbox endpoint (even though, per the
-	// documented limitation, it won't find a cross-boundary route)
-	if _, err := tl.FindPath(context.Background(), FindPathIn{
-		From: "inbox/draft.md", To: "inbox/draft.md",
+	// creating over an existing note fails, with no new commit
+	beforeCount := runTestGit(t, tl.VaultRoot, "rev-list", "--count", "HEAD")
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "drafts/idea.md", Body: "clobber"}); err == nil {
+		t.Fatal("expected error creating over an existing note")
+	}
+	if after := runTestGit(t, tl.VaultRoot, "rev-list", "--count", "HEAD"); after != beforeCount {
+		t.Fatalf("a rejected create must not commit: before=%s after=%s", beforeCount, after)
+	}
+
+	// write_note overwrites
+	if _, err := tl.WriteNote(ctx, WriteNoteIn{
+		Path: "drafts/idea.md", Body: "# idea\n\nrevised\n", Reason: "revising",
 	}); err != nil {
-		t.Fatalf("merged find_path should accept an inbox endpoint: %v", err)
+		t.Fatalf("WriteNote: %v", err)
 	}
-
-	// the vault-only tool refuses an inbox endpoint outright
-	if _, err := tl.FindPathVaultOnly(context.Background(), FindPathIn{
-		From: "inbox/draft.md", To: "engineering/basim/soul.md",
-	}); err == nil {
-		t.Fatal("expected error for an inbox endpoint in find_path_vault_only")
-	}
-
-	// ordinary vault-to-vault pathfinding still works
-	out, err := tl.FindPathVaultOnly(context.Background(), FindPathIn{
-		From: "engineering/basim/character.md", To: "engineering/basim/soul.md", Direction: "out",
-	})
+	got, err = tl.GetNote(ctx, GetNoteIn{Path: "drafts/idea.md"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !out.Found || len(out.Path) != 2 {
-		t.Fatalf("path = %+v", out.Path)
+	if !strings.Contains(got.Body, "revised") {
+		t.Fatalf("body after write = %q", got.Body)
+	}
+	if _, err := tl.WriteNote(ctx, WriteNoteIn{Path: "drafts/nope.md", Body: "x"}); err == nil {
+		t.Fatal("expected error writing a note that doesn't exist")
+	}
+
+	// delete_note removes it, in its own commit
+	if _, err := tl.DeleteNote(ctx, DeleteNoteIn{Path: "drafts/idea.md", Reason: "cleaning up"}); err != nil {
+		t.Fatalf("DeleteNote: %v", err)
+	}
+	if _, err := tl.GetNote(ctx, GetNoteIn{Path: "drafts/idea.md"}); err == nil {
+		t.Fatal("expected error fetching a deleted note")
+	}
+	if msg := runTestGit(t, tl.VaultRoot, "log", "-1", "--pretty=%B"); !strings.HasPrefix(msg, "Delete drafts/idea.md") ||
+		!strings.Contains(msg, "cleaning up") {
+		t.Fatalf("delete commit message = %q", msg)
+	}
+	if _, err := tl.DeleteNote(ctx, DeleteNoteIn{Path: "drafts/idea.md"}); err == nil {
+		t.Fatal("expected error deleting an already-deleted note")
+	}
+
+	// path safety still applies to every write tool
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "../../etc/passwd", Body: "x"}); err == nil {
+		t.Fatal("expected error for a traversal attempt in create_note")
+	}
+}
+
+func TestPushVaultNoRemoteFailsCleanly(t *testing.T) {
+	tl := gitVaultTools(t) // no remote configured
+	out, err := tl.PushVault(context.Background(), PushVaultIn{})
+	if err == nil {
+		t.Fatal("expected an error pushing with no remote configured")
+	}
+	if out.Pushed {
+		t.Fatalf("Pushed = true on a failed push: %+v", out)
+	}
+}
+
+func TestPushVaultSucceeds(t *testing.T) {
+	tl := gitVaultTools(t)
+
+	// a bare repo to stand in for a real remote
+	remote := t.TempDir()
+	runTestGit(t, remote, "init", "-q", "--bare")
+	runTestGit(t, tl.VaultRoot, "remote", "add", "origin", remote)
+
+	branch := strings.TrimSpace(runTestGit(t, tl.VaultRoot, "branch", "--show-current"))
+	runTestGit(t, tl.VaultRoot, "push", "-q", "-u", "origin", branch) // establish upstream once, like a real clone would have
+
+	if _, err := tl.CreateNote(context.Background(), CreateNoteIn{Path: "pushed.md", Body: "# pushed\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := tl.PushVault(context.Background(), PushVaultIn{})
+	if err != nil {
+		t.Fatalf("PushVault: %v (output: %s)", err, out.Output)
+	}
+	if !out.Pushed {
+		t.Fatalf("Pushed = false: %+v", out)
+	}
+
+	// the remote actually has the commit now
+	remoteLog := runTestGit(t, remote, "log", "-1", "--pretty=%s")
+	if !strings.HasPrefix(remoteLog, "Add pushed.md") {
+		t.Fatalf("remote HEAD = %q, want the pushed commit", remoteLog)
+	}
+}
+
+func TestDeleteNoteErrorWrapping(t *testing.T) {
+	tl := gitVaultTools(t)
+	_, err := tl.DeleteNote(context.Background(), DeleteNoteIn{Path: "nope.md"})
+	if err == nil || !strings.Contains(err.Error(), "no such note") {
+		t.Fatalf("err = %v, want a clear 'no such note' message", err)
 	}
 }

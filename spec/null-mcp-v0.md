@@ -1,8 +1,10 @@
 # Null — MCP v0
 
 Model Context Protocol layer over the vault, for a language model to call
-directly instead of going through the JSON API. Same read-only lens, same
-non-negotiables, second presentation — not a second implementation.
+directly instead of going through the JSON API. Same in-memory index as
+`nullapi`, second presentation of the read side — and, unlike `nullapi`,
+the vault's write path too. See CLAUDE.md's "Writes" section for the
+architectural commitment this implements.
 
 **Binary:** `cmd/nullmcp`
 **Transport:** two modes, mutually exclusive, chosen by whether
@@ -38,17 +40,9 @@ addition — `list_notes` and `search_notes` results carry
 `approx_tokens`, `size_bytes / 4`, a rough heuristic, so the model can
 budget a `get_note` call before making it); three are new read
 capabilities with no HTTP equivalent (`find_relatives`, `get_links`,
-`find_path`); two more are "vault only" companions to `get_graph` and
-`find_path` (`get_graph_vault_only`, `find_path_vault_only`), always
-registered regardless of inbox configuration; two are writes, registered
-only when `NULL_INBOX_PATH` is configured (`create_note`, `write_note`).
-
-Every tool result that carries a title runs it through the inbox label
-(see "Inbox" below) — this is not opt-in per call. A model reading any
-`list_notes`/`search_notes`/`get_note`/`get_graph`/`find_relatives`/
-`get_links`/`find_path` result sees, unmissably, which notes are settled
-vault content and which are its own (or another session's) unreviewed
-drafts.
+`find_path`); four are writes (`create_note`, `write_note`,
+`delete_note`, `push_vault`) — always registered, no configuration gate,
+since writing is now unconditional (see "Writes" below).
 
 ### `list_notes`
 
@@ -67,9 +61,9 @@ leak.
 
 ### `get_note`
 
-Mirrors `GET /v1/notes/{path}`. The only tool that returns a body, capped
-at the same `NULL_MAX_BODY_BYTES` the HTTP API uses (default 200000); past
-that it returns a tool error pointing at `section`.
+Mirrors `GET /v1/notes/{path}`. The only read tool that returns a body,
+capped at the same `NULL_MAX_BODY_BYTES` the HTTP API uses (default
+200000); past that it returns a tool error pointing at `section`.
 
 | field | type | notes |
 |---|---|---|
@@ -99,22 +93,6 @@ wikilink was written on.
 | `path` | string | required |
 | `depth` | int | 1–3, default 1 |
 | `direction` | string | `out` \| `in` \| `both` (default) |
-
-Includes inbox content: the root may itself be an inbox note, and inbox
-nodes appear wherever the traversal reaches them (which today, given the
-cross-boundary limitation below, only happens when the root itself is on
-the inbox side).
-
-### `get_graph_vault_only`
-
-Same shape and params as `get_graph`, restricted to the vault
-unconditionally — registered whether or not `NULL_INBOX_PATH` is set, and
-guarantees zero inbox exposure: an inbox-prefixed `path` is rejected as
-"no such note" before any traversal happens, never silently walked. Use
-this over `get_graph` when the caller specifically needs to know the
-answer holds regardless of whatever is currently sitting in the inbox —
-e.g. checking whether something is already established before drafting a
-new note about it.
 
 ### `find_relatives`
 
@@ -157,76 +135,101 @@ not an error, the same way a zero-hit search isn't one.
 | `depth` | int | max hops, 1–6, default 4 |
 | `direction` | string | `out` \| `in` \| `both` (default) |
 
-Either endpoint may be an inbox note.
+### `create_note`
 
-### `find_path_vault_only`
-
-Same shape and params as `find_path`, restricted to the vault
-unconditionally — registered whether or not `NULL_INBOX_PATH` is set.
-Either `from` or `to` being an inbox-prefixed path fails as "no such
-note," the same guarantee `get_graph_vault_only` makes.
-
-### `create_note` / `write_note` — inbox only
-
-Registered only when `NULL_INBOX_PATH` is set. `path` must start with
-`inbox/`; anything else is rejected before touching disk. `create_note`
-fails if a note already exists there (`ErrNoteExists`); `write_note` fails
-if one doesn't (`ErrNoteNotFound`) — deliberately no upsert, so a typo'd
-path can't silently create a stray note or silently clobber an existing
-one.
+Writes a brand-new note directly into the vault and commits it — `git
+add` + `git commit -m "Add <path>[, plus reason]" -- <path>`, exactly
+that one file, nothing else staged or swept in. Fails with a clear error
+if a note already exists at that path (never a silent overwrite); use
+`write_note` for that deliberately.
 
 | field | type | notes |
 |---|---|---|
-| `path` | string | required; `inbox/...` |
+| `path` | string | required, vault-relative |
 | `frontmatter` | object | optional |
 | `body` | string | required |
+| `reason` | string | optional; appended to the commit message body |
 
-Both call `vault.Index.Refresh` on the inbox index synchronously after a
-successful write, so the very next `get_note`/`list_notes`/`search_notes`
-call sees the change immediately — no race against the watcher's 200ms
-debounce.
+Calls `vault.Index.Refresh` synchronously after the commit, so the very
+next `get_note`/`list_notes`/`search_notes` call sees the change
+immediately — no race against the watcher's 200ms debounce.
 
-## Inbox
+### `write_note`
 
-A second directory, `NULL_INBOX_PATH`, physically separate from
-`NULL_VAULT_PATH` and never part of the `null-vault` git repo — see
-CLAUDE.md's "Inbox" section for the full rationale. In this package:
+Overwrites an existing note wholesale — the given body and frontmatter
+replace what was there entirely, not a merge or a patch — and commits it
+as `"Update <path>"`. Fails if nothing exists yet at that path; use
+`create_note` for a new one. Same fields and `Refresh` behavior as
+`create_note`.
 
-- **`internal/vault/write.go`** — `CreateNote`/`WriteNote`, the only code
-  in this repository that opens a file for anything but `O_RDONLY`, and
-  only ever against `NULL_INBOX_PATH`.
-- **`internal/vault/combined.go`** — `Combined` merges a vault `Index` and
-  an inbox `Index` into one `Reader`, prefixing every inbox path with
-  `inbox/` (`mcp.InboxPrefix`) so it can never collide with a real vault
-  path. `Tools.Index` is typed `vault.Reader` precisely so it can hold
-  either a plain `Index` (no inbox configured) or a `Combined`.
-- **Search** is a separate `ripgrep` process per root — `Tools.Search`
-  over the vault, `Tools.InboxSearch` over the inbox (nil when
-  unconfigured) — merged by `SearchNotes` the same way `Combined` merges
-  reads.
-- **Known v0 limitation:** link resolution, backlinks, and `get_graph`/
-  `find_path` traversal do not cross the vault/inbox boundary. A draft's
-  wikilink to a real note (or a real note's link to something that will
-  later live in the inbox — not a real scenario since inbox notes don't
-  exist yet at promotion time, but stated for completeness) stays
-  unresolved until the note is promoted, at which point it's just a
-  normal note in a normal `Index` and resolves normally. `Resolve` (used
-  by would-be renderer integration, not currently wired to `nullapi`) is
-  the one method that does cross the boundary, because a plain
-  target→path lookup is cheap and safe in a way pre-computing every
-  cross-boundary graph edge is not.
-- **Boot-time guard:** a vault with a literal top-level `inbox/` directory
-  fails `nullmcp` startup rather than silently shadowing real notes under
-  the reserved namespace.
+### `delete_note`
+
+Removes a note (`git rm` — deletes and stages in one step) and commits
+the removal as `"Delete <path>"`. No confirmation step beyond the tool
+call itself: the commit *is* the confirmation, after the fact. Undoing a
+deletion is a single `git revert` of exactly that commit, never entangled
+with any other change, because there is never more than one change per
+commit.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+| `reason` | string | optional; appended to the commit message body |
+
+### `push_vault`
+
+Pushes every local commit made by `create_note`/`write_note`/
+`delete_note` since the last push to the vault's configured git remote.
+No parameters. Deliberately separate from every write tool — nothing
+leaves this server until this is called on purpose. A rejected push
+(non-fast-forward, no remote configured, etc.) is reported as a tool
+error carrying git's own message; this tool never force-pushes and never
+attempts to resolve a conflict itself — that decision belongs to a human
+looking at the actual conflicting history.
+
+## Writes: the git-commit-per-note model
+
+Every one of the four write tools ends in exactly one commit touching
+exactly one file — this is the whole safety model, replacing an earlier
+design (a physically separate inbox staging directory) that was
+deliberately dropped in favor of git discipline enforced by the code:
+
+- **`internal/vault/write.go`** is the only file in this codebase that
+  opens a vault file for anything but `O_RDONLY` — `CreateNote`,
+  `WriteNote`, `DeleteNote`, `PushVault`. A package-level mutex
+  (`gitMu`) serializes every stage-then-commit sequence, so two
+  concurrent tool calls can never interleave into a shared commit;
+  proven by `TestConcurrentWritesEachGetTheirOwnCommit`.
+- **`vault.EnsureGitRepo`** is checked once at `nullmcp` boot: a
+  `NULL_VAULT_PATH` that isn't a git repository fails startup, never a
+  write attempt at runtime.
+- **Commit identity** comes from `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+  `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` set on the git subprocess
+  itself (`NULL_MCP_GIT_NAME`/`NULL_MCP_GIT_EMAIL` override the defaults,
+  `"nullmcp"`/`"nullmcp@localhost"`) — this works regardless of whether
+  the runtime environment has any git identity configured on disk, which
+  a container typically won't.
+- **`safe.directory=*`** is passed on every git invocation. Without it, a
+  git process running as a container user against a bind-mounted volume
+  owned by a different host UID — the normal shape of this deployment —
+  refuses to operate at all ("detected dubious ownership"). The
+  protection this disables doesn't apply here: `NULL_VAULT_PATH` is one
+  hardcoded, operator-chosen path this process is built to write to, not
+  an arbitrary directory it wanders into.
+- **Deployment**: `compose.yaml`'s `nullmcp` service mounts the *same*
+  host vault directory as `nullapi`'s service, but without `:ro` — the
+  one write-capable mount in the whole deployment. The Docker image
+  needs `git` installed alongside `ripgrep` for this to work at all.
 
 ## Error semantics
 
 Business errors — unknown path, unresolved cursor, unknown section, body
-over cap, bad argument — come back as **tool-level** errors
-(`CallToolResult.IsError = true`, message in `Content`), not MCP protocol
-errors. This is deliberate and SDK-supported: a protocol error is
-invisible to the calling model, so it can't read the message or retry
-differently. A tool error is content the model actually sees.
+over cap, bad argument, a failed write or push — come back as
+**tool-level** errors (`CallToolResult.IsError = true`, message in
+`Content`), not MCP protocol errors. This is deliberate and
+SDK-supported: a protocol error is invisible to the calling model, so it
+can't read the message or retry differently. A tool error is content the
+model actually sees.
 
 Malformed arguments (wrong JSON type against the schema) are rejected by
 the SDK before the handler runs, same effect either way.
@@ -238,7 +241,8 @@ zero-JS HTTP page for manually calling tools during development. It
 connects a real MCP client to the running server over an in-memory
 transport (`mcp.NewInMemoryTransports`) — the same mechanism the SDK's own
 tests use — so what you see is a real protocol round trip, not a shortcut
-around one.
+around one. This includes the write tools: using it against a real vault
+creates real commits, same as any other client.
 
 Opt-in only: set `NULL_MCP_INSPECTOR_ADDR` (e.g. `127.0.0.1:8090`). Empty
 disables it. No auth, keep it on loopback, never run it on the VPS.
@@ -344,20 +348,20 @@ everywhere else in this stack: this binary does not do TLS.
 
 ## Deliberately absent from v0
 
-- **Any tool that writes to the vault.** `create_note`/`write_note` only
-  ever open files under `NULL_INBOX_PATH`; there is no tool, and there
-  must never be one, that opens anything but `O_RDONLY` under
-  `NULL_VAULT_PATH`.
-- **A promotion tool.** Moving a reviewed inbox note into the vault is a
-  human `git commit`, not a server action — see CLAUDE.md's "Inbox"
-  section. Automating that step is automating the review it exists to
-  force.
-- **Cross-boundary graph edges** (see "Inbox" above) — a real gap, kept
-  open deliberately rather than built around, since the correct fix
-  (merging resolution, not just reads, across two indices) is bigger than
-  this pass and not yet worth it until promoted-vs-draft linking has come
-  up in practice.
-- **Embeddings/RAG, in either the vault or the inbox.** Same reasoning as
-  the read API: not specifiable yet.
-- **A resources/prompts MCP surface.** Only tools are registered. Notes are
-  not exposed as MCP resources; nothing here has needed it yet.
+- **`nullapi`/the renderer writing.** The write path is `nullmcp` only —
+  see CLAUDE.md's non-negotiable #2 and "Writes" above.
+- **A promotion tool, in the old inbox-staging sense.** There's nothing
+  left to promote — `create_note`/`write_note`/`delete_note` already
+  write straight to the vault. What remains a deliberate human act is
+  `push_vault`: nothing reaches the remote without that explicit call.
+- **Force-push or automatic conflict resolution in `push_vault`.** A
+  rejected push is reported and stops there — resolving diverged history
+  is a human decision, not a default this tool guesses at.
+- **Any kind of write confirmation/review step inside the protocol.** Git
+  *is* the review mechanism, after the fact (revert a bad commit) rather
+  than before it lands. This was a deliberate choice, not an oversight —
+  see CLAUDE.md's "Writes" section for the reasoning.
+- **Embeddings/RAG.** Same reasoning as the read API: not specifiable
+  yet.
+- **A resources/prompts MCP surface.** Only tools are registered. Notes
+  are not exposed as MCP resources; nothing here has needed it yet.

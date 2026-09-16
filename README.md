@@ -65,44 +65,26 @@ No editor, no JS, one stylesheet.
 ### MCP server
 
 For a language model to call the vault directly instead of going through
-HTTP. Eleven tools: `list_notes`, `get_note`, `search_notes`, `get_graph`
-mirror the HTTP routes; `find_relatives` (folder/tag siblings),
-`get_links` (one note's outlinks+backlinks in one call), and `find_path`
-(shortest link chain between two notes) are new, read-only, no HTTP
-equivalent. `get_graph`/`find_path` include inbox content when an inbox
-is configured (a query can be rooted at, or end at, a draft);
-`get_graph_vault_only`/`find_path_vault_only` are always-available
-companions that guarantee the opposite — a settled-vault-only view no
-draft can ever slip into, regardless of configuration.
-`create_note`/`write_note` are writes, and only exist at all when
-`NULL_INBOX_PATH` is configured. Full contract in
-[`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
+HTTP — including writing to it. Eleven tools: `list_notes`, `get_note`,
+`search_notes`, `get_graph` mirror the HTTP routes; `find_relatives`
+(folder/tag siblings), `get_links` (one note's outlinks+backlinks in one
+call), and `find_path` (shortest link chain between two notes) are new,
+read-only, no HTTP equivalent; `create_note`, `write_note`, `delete_note`,
+and `push_vault` are the write path — always available, no configuration
+flag. Full contract in [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
+
+**`NULL_VAULT_PATH` must already be a git repository** — checked at boot.
+Every `create_note`/`write_note`/`delete_note` call becomes exactly one
+git commit, touching exactly one file: `"Add <path>"`, `"Update <path>"`,
+`"Delete <path>"`, plus an optional `reason` field appended to the
+message. That's the whole safety model — a bad write is one `git revert`
+away from gone, never entangled with anything else, because there's
+never more than one change per commit. `push_vault` is a separate,
+explicit tool; nothing reaches the remote until it's called on purpose.
 
 ```sh
 NULL_VAULT_PATH=/srv/null-vault go run ./cmd/nullmcp
 ```
-
-#### Inbox (optional — enables create_note/write_note)
-
-```sh
-NULL_VAULT_PATH=/srv/null-vault NULL_INBOX_PATH=/srv/null-inbox go run ./cmd/nullmcp
-```
-
-`NULL_INBOX_PATH` is a second, physically separate directory — never part
-of the `null-vault` git repo. It's the *only* thing any write tool ever
-opens read-write; `NULL_VAULT_PATH` stays exactly as read-only as it is
-in `nullapi`, unconditionally. Notes written there show up immediately
-(no restart, no race against the watcher) in every read tool, addressed
-as `inbox/<path>` and labeled — same shape as any other note, just with
-`source: "inbox"` and a `[inbox — draft, not yet reviewed or promoted]`
-suffix on the title, so a model can't mistake a draft for settled fact.
-
-Promoting a draft into the real vault is a human act, on purpose: review
-it, move it into `null-vault`, `git add && commit && push` yourself. No
-tool here does that step for you — see CLAUDE.md's "Inbox" section for
-why, and `spec/null-mcp-v0.md` for the one real limitation this has today
-(links between a draft and a real note don't appear as graph edges until
-the draft is promoted).
 
 Speaks stdio — point a client (Claude Desktop, Claude Code, etc.) at the
 binary as a subprocess, e.g. in Claude Desktop's config:
@@ -181,11 +163,15 @@ docker compose exec nullapi sh -c 'mount | grep vault && touch /vault/x; echo ex
 
 `compose.yaml` also has an `nullmcp` service (same image, different
 entrypoint) for the HTTP transport — add to `.env` and it starts
-alongside `nullapi`:
+alongside `nullapi`, mounting the *same* `VAULT_PATH` but read-write
+(nullapi's mount stays `:ro`; nullmcp's does not — see "MCP server"
+above). `VAULT_PATH` must already be a git repository before you start
+this service — `git init && git add -A && git commit -m seed`, if it
+isn't one yet:
 
 ```sh
 echo "NULL_MCP_TOKEN=$(openssl rand -hex 32)" >> .env   # separate from NULL_TOKEN, deliberately
-echo "INBOX_PATH=/srv/null-inbox" >> .env
+echo "NULL_MCP_PUBLIC_URL=https://your-host:10000" >> .env
 docker compose up -d --build
 ```
 

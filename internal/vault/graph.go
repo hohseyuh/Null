@@ -8,7 +8,6 @@ type GraphNode struct {
 	Path     string `json:"path"`
 	Title    string `json:"title"`
 	Distance int    `json:"distance"`
-	Source   string `json:"source"`
 }
 
 // GraphResult is the neighborhood of one note. Nodes exclude the root
@@ -73,11 +72,11 @@ func (ix *Index) Graph(root string, depth int, direction string) GraphResult {
 		if p == root {
 			continue
 		}
-		title, source := "", ""
+		title := ""
 		if n, ok := ix.notes[p]; ok {
-			title, source = n.Title, n.Source
+			title = n.Title
 		}
-		res.Nodes = append(res.Nodes, GraphNode{Path: p, Title: title, Distance: dist, Source: source})
+		res.Nodes = append(res.Nodes, GraphNode{Path: p, Title: title, Distance: dist})
 	}
 	ix.mu.RUnlock()
 
