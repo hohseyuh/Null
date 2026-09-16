@@ -24,7 +24,9 @@ func testServer(t *testing.T) *sdkmcp.Server {
 	if err != nil {
 		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
 	}
-	return NewServer(ix, se, nil, nil, fixtureVault, "", 200_000, log)
+	return NewServer(&Tools{
+		Index: ix, VaultIndex: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log,
+	})
 }
 
 // testServerWithInbox is testServer plus a fresh, empty temp-dir inbox —
@@ -55,7 +57,12 @@ func testServerWithInbox(t *testing.T) (*sdkmcp.Server, string) {
 	}
 
 	combined := vault.NewCombined(primary, inboxIx, InboxPrefix)
-	return NewServer(combined, se, inboxSe, inboxIx, fixtureVault, inboxRoot, 200_000, log), inboxRoot
+	server := NewServer(&Tools{
+		Index: combined, VaultIndex: primary, Search: se, InboxSearch: inboxSe,
+		VaultRoot: fixtureVault, InboxRoot: inboxRoot, InboxIndex: inboxIx,
+		MaxBodyBytes: 200_000, Log: log,
+	})
+	return server, inboxRoot
 }
 
 // connect starts server over an in-memory transport and returns a
@@ -86,6 +93,7 @@ func TestServerAdvertisesReadToolsButNotWriteToolsWithoutInbox(t *testing.T) {
 	want := map[string]bool{
 		"list_notes": false, "get_note": false, "search_notes": false, "get_graph": false,
 		"find_relatives": false, "get_links": false, "find_path": false,
+		"get_graph_vault_only": false, "find_path_vault_only": false,
 	}
 	for _, tool := range res.Tools {
 		if tool.Name == "create_note" || tool.Name == "write_note" {
@@ -272,6 +280,18 @@ func TestServerInboxLifecycle(t *testing.T) {
 		"path": "inbox/../../etc/passwd", "body": "x",
 	}, nil); !res.IsError {
 		t.Fatal("expected error for a traversal attempt")
+	}
+
+	// get_graph sees the inbox note when rooted there; get_graph_vault_only refuses it
+	var graph GetGraphOut
+	callTool(t, session, "get_graph", map[string]any{"path": "inbox/thought.md"}, &graph)
+	if graph.Root != "inbox/thought.md" {
+		t.Fatalf("get_graph root = %q", graph.Root)
+	}
+	if res := callTool(t, session, "get_graph_vault_only", map[string]any{
+		"path": "inbox/thought.md",
+	}, nil); !res.IsError {
+		t.Fatal("expected get_graph_vault_only to refuse an inbox root")
 	}
 }
 

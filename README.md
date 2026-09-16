@@ -65,12 +65,17 @@ No editor, no JS, one stylesheet.
 ### MCP server
 
 For a language model to call the vault directly instead of going through
-HTTP. Nine tools: `list_notes`, `get_note`, `search_notes`, `get_graph`
+HTTP. Eleven tools: `list_notes`, `get_note`, `search_notes`, `get_graph`
 mirror the HTTP routes; `find_relatives` (folder/tag siblings),
 `get_links` (one note's outlinks+backlinks in one call), and `find_path`
 (shortest link chain between two notes) are new, read-only, no HTTP
-equivalent; `create_note`/`write_note` are writes, and only exist at all
-when `NULL_INBOX_PATH` is configured. Full contract in
+equivalent. `get_graph`/`find_path` include inbox content when an inbox
+is configured (a query can be rooted at, or end at, a draft);
+`get_graph_vault_only`/`find_path_vault_only` are always-available
+companions that guarantee the opposite — a settled-vault-only view no
+draft can ever slip into, regardless of configuration.
+`create_note`/`write_note` are writes, and only exist at all when
+`NULL_INBOX_PATH` is configured. Full contract in
 [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
 
 ```sh

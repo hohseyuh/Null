@@ -2,12 +2,8 @@ package mcp
 
 import (
 	"context"
-	"log/slog"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"null-service/internal/search"
-	"null-service/internal/vault"
 )
 
 // serverInfo names this server to clients during MCP initialization.
@@ -22,32 +18,24 @@ const inboxNote = " Results may include inbox notes — unreviewed drafts, " +
 	"and source:\"inbox\" — alongside settled vault notes; treat those as " +
 	"provisional, not established fact."
 
-// NewServer builds an MCP server exposing the vault as MCP tools and
-// registers them. It assumes ix and se are already built and verified —
-// the same objects nullapi would use — and shares them directly, in
-// process: this is a second presentation of the read API, not a second
-// implementation of it.
-//
-// create_note and write_note are registered only when inboxRoot is
-// non-empty — an unconfigured inbox means no write tools exist at all,
-// not write tools that exist and fail at call time. Nothing this server
-// does ever opens a file under vaultRoot for anything but reading;
-// inboxSearch and inboxIndex may be nil (together, when inboxRoot is
-// empty) — inboxSearch's absence disables inbox coverage in
-// search_notes' body mode, inboxIndex is what CreateNote/WriteNote
-// refresh synchronously after a write (see Tools.InboxIndex).
-func NewServer(ix vault.Reader, se, inboxSearch *search.Searcher, inboxIndex *vault.Index, vaultRoot, inboxRoot string, maxBodyBytes int64, log *slog.Logger) *sdkmcp.Server {
-	t := &Tools{
-		Index:        ix,
-		Search:       se,
-		InboxSearch:  inboxSearch,
-		VaultRoot:    vaultRoot,
-		InboxRoot:    inboxRoot,
-		InboxIndex:   inboxIndex,
-		MaxBodyBytes: maxBodyBytes,
-		Log:          log,
-	}
+// vaultOnlyNote is the mirror-image note on the "_vault_only" tools: they
+// never carry inbox content, on purpose, regardless of configuration.
+const vaultOnlyNote = " Vault only — inbox notes never appear here, even " +
+	"when an inbox is configured; an inbox-prefixed path is rejected as " +
+	"unknown, the same as any other path the vault doesn't have."
 
+// NewServer builds an MCP server exposing t's tools and registers them.
+// It assumes t's dependencies are already built and verified — the same
+// objects nullapi would use — and shares them directly, in process: this
+// is a second presentation of the read API, not a second implementation
+// of it.
+//
+// create_note and write_note are registered only when t.InboxRoot is
+// non-empty — an unconfigured inbox means no write tools exist at all,
+// not write tools that exist and fail at call time. get_graph_vault_only
+// and find_path_vault_only are always registered: t.VaultIndex is always
+// the pure vault side, present whether or not an inbox is configured.
+func NewServer(t *Tools) *sdkmcp.Server {
 	s := sdkmcp.NewServer(serverInfo, nil)
 
 	sdkmcp.AddTool(s, &sdkmcp.Tool{
@@ -92,11 +80,25 @@ func NewServer(ix vault.Reader, se, inboxSearch *search.Searcher, inboxIndex *va
 			"out/in/both, up to depth 3. Each edge carries the exact line its " +
 			"link was written on — the stated reason two notes are connected, " +
 			"not just that they are. Cheaper than fetching notes to rediscover " +
-			"their relationships. Does not cross the vault/inbox boundary: a " +
-			"draft's link to a settled note (or back) only becomes a graph edge " +
-			"once the draft is promoted." + inboxNote,
+			"their relationships. The root may itself be an inbox note, and " +
+			"inbox nodes appear wherever reached; does not cross the " +
+			"vault/inbox boundary within one traversal — a draft's link to a " +
+			"settled note (or back) only becomes a graph edge once the draft is " +
+			"promoted. Use get_graph_vault_only for a guaranteed inbox-free " +
+			"view." + inboxNote,
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in GetGraphIn) (*sdkmcp.CallToolResult, GetGraphOut, error) {
 		out, err := t.GetGraph(ctx, in)
+		return nil, out, err
+	})
+
+	sdkmcp.AddTool(s, &sdkmcp.Tool{
+		Name: "get_graph_vault_only",
+		Description: "Identical to get_graph, restricted to the settled vault — " +
+			"use this for a view you know can't be contaminated by an " +
+			"in-progress draft, e.g. when deciding whether something is already " +
+			"established before writing a new note about it." + vaultOnlyNote,
+	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in GetGraphIn) (*sdkmcp.CallToolResult, GetGraphOut, error) {
+		out, err := t.GetGraphVaultOnly(ctx, in)
 		return nil, out, err
 	})
 
@@ -129,13 +131,24 @@ func NewServer(ix vault.Reader, se, inboxSearch *search.Searcher, inboxIndex *va
 			"up to 6 hops — 'how are these two related, if at all' rather than " +
 			"get_graph's 'what surrounds this one note.' found:false with an " +
 			"empty path means no route was found within the depth searched, not " +
-			"an error. Does not cross the vault/inbox boundary — see get_graph." + inboxNote,
+			"an error. Either endpoint may be an inbox note; does not cross the " +
+			"vault/inbox boundary within one search — see get_graph. Use " +
+			"find_path_vault_only for a guaranteed inbox-free search." + inboxNote,
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in FindPathIn) (*sdkmcp.CallToolResult, FindPathOut, error) {
 		out, err := t.FindPath(ctx, in)
 		return nil, out, err
 	})
 
-	if inboxRoot != "" {
+	sdkmcp.AddTool(s, &sdkmcp.Tool{
+		Name: "find_path_vault_only",
+		Description: "Identical to find_path, restricted to the settled vault — " +
+			"both endpoints must be vault notes; an inbox path fails as unknown." + vaultOnlyNote,
+	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in FindPathIn) (*sdkmcp.CallToolResult, FindPathOut, error) {
+		out, err := t.FindPathVaultOnly(ctx, in)
+		return nil, out, err
+	})
+
+	if t.InboxRoot != "" {
 		sdkmcp.AddTool(s, &sdkmcp.Tool{
 			Name: "create_note",
 			Description: "Create a new note. Path must start with 'inbox/' — the " +

@@ -35,11 +35,18 @@ import (
 //
 // Index is a vault.Reader rather than a concrete *vault.Index so it can
 // be either a plain vault-only index or a vault.Combined merging in the
-// inbox. InboxRoot gates the write tools: empty means "no inbox
-// configured," and create_note/write_note are not registered at all
-// (see server.go) rather than registered and failing at call time.
+// inbox — this is the "default" reader most tools use, which includes
+// inbox content whenever an inbox is configured. VaultIndex is always
+// the pure vault side alone, with or without an inbox configured, used
+// only by the "_vault_only" graph/pathfinder tools that must never
+// surface inbox content no matter what. InboxRoot gates the write tools
+// (and the "_vault_only" tools' need to distinguish an inbox path from a
+// vault one): empty means "no inbox configured," and create_note/
+// write_note are not registered at all (see server.go) rather than
+// registered and failing at call time.
 type Tools struct {
 	Index       vault.Reader
+	VaultIndex  vault.Reader // always vault-only; see doc above
 	Search      *search.Searcher
 	InboxSearch *search.Searcher // nil disables inbox body search; see safeInboxPath
 	VaultRoot   string
@@ -527,16 +534,17 @@ type GetGraphOut struct {
 	Edges []GraphEdgeOut `json:"edges"`
 }
 
-// GetGraph mirrors GET /v1/graph: the BFS neighborhood of one note, with
-// the line each wikilink was written on — why two notes are connected,
-// not just that they are. Cheaper than fetching notes to rediscover
-// their relationships.
-func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) {
-	rel, err := t.safeMergedPath(in.Path)
+// getGraph is the shared core of GetGraph and GetGraphVaultOnly: same
+// traversal and shaping, over whichever reader/path-resolver the caller
+// supplies. Neither public entry point exposes reader or resolvePath as
+// parameters a model could set — which one applies is a property of
+// which tool was called, not an argument.
+func (t *Tools) getGraph(reader vault.Reader, resolvePath func(string) (string, error), toolName string, in GetGraphIn) (GetGraphOut, error) {
+	rel, err := resolvePath(in.Path)
 	if err != nil {
 		return GetGraphOut{}, fmt.Errorf("invalid path %q: %w", in.Path, err)
 	}
-	if _, ok := t.Index.Get(rel); !ok {
+	if _, ok := reader.Get(rel); !ok {
 		return GetGraphOut{}, fmt.Errorf("no such note: %s", rel)
 	}
 
@@ -556,7 +564,7 @@ func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) 
 		return GetGraphOut{}, fmt.Errorf("direction must be 'out', 'in', or 'both'")
 	}
 
-	g := t.Index.Graph(rel, depth, direction)
+	g := reader.Graph(rel, depth, direction)
 	out := GetGraphOut{
 		Root:  g.Root,
 		Nodes: make([]GraphNodeOut, 0, len(g.Nodes)),
@@ -572,8 +580,27 @@ func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) 
 	for _, e := range g.Edges {
 		out.Edges = append(out.Edges, GraphEdgeOut{From: e.From, To: e.To, Context: e.Context})
 	}
-	t.logResult("get_graph", len(out.Nodes))
+	t.logResult(toolName, len(out.Nodes))
 	return out, nil
+}
+
+// GetGraph mirrors GET /v1/graph: the BFS neighborhood of one note, with
+// the line each wikilink was written on — why two notes are connected,
+// not just that they are. Cheaper than fetching notes to rediscover
+// their relationships. Includes inbox content: the root may itself be an
+// inbox note, and inbox nodes appear wherever the traversal reaches them.
+func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) {
+	return t.getGraph(t.Index, t.safeMergedPath, "get_graph", in)
+}
+
+// GetGraphVaultOnly is GetGraph restricted to the vault, unconditionally —
+// available whether or not an inbox is configured, and guarantees no
+// inbox content anywhere in the result: an inbox-prefixed root is
+// rejected as "no such note," the same as any other path the vault
+// doesn't have, never silently traversed.
+func (t *Tools) GetGraphVaultOnly(_ context.Context, in GetGraphIn) (GetGraphOut, error) {
+	resolve := func(p string) (string, error) { return vault.SafeRequestPath(t.VaultRoot, p) }
+	return t.getGraph(t.VaultIndex, resolve, "get_graph_vault_only", in)
 }
 
 // FindRelativesIn is the input to find_relatives.
@@ -764,24 +791,24 @@ type FindPathOut struct {
 	Path  []PathStep `json:"path"`
 }
 
-// FindPath finds the shortest chain of wikilinks connecting two notes —
-// "how, if at all, are these related" for two specific notes, as opposed
-// to get_graph's "what's in this note's neighborhood." Like get_graph,
-// it does not cross the vault/inbox boundary (see package doc on
-// vault.Combined); a path through a promoted note works once promoted.
-func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) {
-	fromRel, err := t.safeMergedPath(in.From)
+// findPath is the shared core of FindPath and FindPathVaultOnly: same
+// BFS and reconstruction, over whichever reader/path-resolver the caller
+// supplies. Neither public entry point exposes reader or resolvePath as
+// parameters a model could set — which one applies is a property of
+// which tool was called, not an argument.
+func (t *Tools) findPath(reader vault.Reader, resolvePath func(string) (string, error), toolName string, in FindPathIn) (FindPathOut, error) {
+	fromRel, err := resolvePath(in.From)
 	if err != nil {
 		return FindPathOut{}, fmt.Errorf("invalid from %q: %w", in.From, err)
 	}
-	toRel, err := t.safeMergedPath(in.To)
+	toRel, err := resolvePath(in.To)
 	if err != nil {
 		return FindPathOut{}, fmt.Errorf("invalid to %q: %w", in.To, err)
 	}
-	if _, ok := t.Index.Get(fromRel); !ok {
+	if _, ok := reader.Get(fromRel); !ok {
 		return FindPathOut{}, fmt.Errorf("no such note: %s", fromRel)
 	}
-	if _, ok := t.Index.Get(toRel); !ok {
+	if _, ok := reader.Get(toRel); !ok {
 		return FindPathOut{}, fmt.Errorf("no such note: %s", toRel)
 	}
 
@@ -808,10 +835,10 @@ func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) 
 		for _, p := range frontier {
 			var edges []vault.Edge
 			if direction == "out" || direction == "both" {
-				edges = append(edges, t.Index.Outlinks(p)...)
+				edges = append(edges, reader.Outlinks(p)...)
 			}
 			if direction == "in" || direction == "both" {
-				edges = append(edges, t.Index.Backlinks(p)...)
+				edges = append(edges, reader.Backlinks(p)...)
 			}
 			for _, e := range edges {
 				other := e.To
@@ -829,7 +856,7 @@ func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) 
 	}
 
 	if _, ok := preds[toRel]; !ok {
-		t.logResult("find_path", 0)
+		t.logResult(toolName, 0)
 		return FindPathOut{Found: false, Path: []PathStep{}}, nil
 	}
 
@@ -845,15 +872,35 @@ func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) 
 
 	steps := make([]PathStep, len(chain))
 	for i, p := range chain {
-		n, _ := t.Index.Get(p)
+		n, _ := reader.Get(p)
 		steps[i] = PathStep{Path: p, Title: displayTitle(n), Source: n.Source}
 		if i > 0 {
 			steps[i].Via = preds[p].via
 		}
 	}
 
-	t.logResult("find_path", len(steps))
+	t.logResult(toolName, len(steps))
 	return FindPathOut{Found: true, Path: steps}, nil
+}
+
+// FindPath finds the shortest chain of wikilinks connecting two notes —
+// "how, if at all, are these related" for two specific notes, as opposed
+// to get_graph's "what's in this note's neighborhood." Includes inbox
+// content: either end may be an inbox note. Does not cross the
+// vault/inbox boundary within a single search (see package doc on
+// vault.Combined); a path through a promoted note works once promoted.
+func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) {
+	return t.findPath(t.Index, t.safeMergedPath, "find_path", in)
+}
+
+// FindPathVaultOnly is FindPath restricted to the vault, unconditionally —
+// available whether or not an inbox is configured, and guarantees no
+// inbox note ever appears as an endpoint or a step: an inbox-prefixed
+// from/to is rejected as "no such note," the same as any other path the
+// vault doesn't have.
+func (t *Tools) FindPathVaultOnly(_ context.Context, in FindPathIn) (FindPathOut, error) {
+	resolve := func(p string) (string, error) { return vault.SafeRequestPath(t.VaultRoot, p) }
+	return t.findPath(t.VaultIndex, resolve, "find_path_vault_only", in)
 }
 
 // CreateNoteIn is the input to create_note.

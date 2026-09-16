@@ -165,7 +165,17 @@ func run(log *slog.Logger) error {
 		log.Info("inbox configured", "path", cfg.inboxPath, "notes", inboxIndex.Len())
 	}
 
-	server := nullmcp.NewServer(index, searcher, inboxSearcher, inboxIndex, cfg.vaultPath, cfg.inboxPath, cfg.maxBodyBytes, log)
+	server := nullmcp.NewServer(&nullmcp.Tools{
+		Index:        index,
+		VaultIndex:   vaultIndex,
+		Search:       searcher,
+		InboxSearch:  inboxSearcher,
+		VaultRoot:    cfg.vaultPath,
+		InboxRoot:    cfg.inboxPath,
+		InboxIndex:   inboxIndex,
+		MaxBodyBytes: cfg.maxBodyBytes,
+		Log:          log,
+	})
 
 	if cfg.inspectorAddr != "" {
 		if err := startInspector(ctx, server, cfg.inspectorAddr, log); err != nil {

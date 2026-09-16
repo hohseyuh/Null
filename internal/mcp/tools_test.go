@@ -25,7 +25,7 @@ func testTools(t *testing.T) *Tools {
 	if err != nil {
 		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
 	}
-	return &Tools{Index: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log}
+	return &Tools{Index: ix, VaultIndex: ix, Search: se, VaultRoot: fixtureVault, MaxBodyBytes: 200_000, Log: log}
 }
 
 func TestListNotesMetadataOnly(t *testing.T) {
@@ -299,5 +299,120 @@ func TestFindPath(t *testing.T) {
 	}
 	if _, err := tl.FindPath(context.Background(), FindPathIn{From: "plain.md", To: "plain.md", Depth: 7}); err == nil {
 		t.Fatal("expected error for depth > 6")
+	}
+}
+
+// buildToolsWithInbox is testTools plus an inbox index sharing the same
+// physical directory an actual inbox would use, for testing the
+// "_vault_only" tools against a real merged Index the way nullmcp builds
+// one — not just the bare vault index testTools alone would give.
+func buildToolsWithInbox(t *testing.T, inboxFiles map[string]string) *Tools {
+	t.Helper()
+	log := slog.New(slog.DiscardHandler)
+
+	primary := vault.NewIndex(fixtureVault, log)
+	if err := primary.Build(); err != nil {
+		t.Fatal(err)
+	}
+	se, err := search.New(fixtureVault)
+	if err != nil {
+		t.Fatalf("search.New: %v (is ripgrep installed?)", err)
+	}
+
+	inboxRoot := t.TempDir()
+	for rel, content := range inboxFiles {
+		if err := vault.CreateNote(inboxRoot, rel, nil, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inboxIx := vault.NewIndex(inboxRoot, log)
+	inboxIx.Source = vault.SourceInbox
+	if err := inboxIx.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	return &Tools{
+		Index: vault.NewCombined(primary, inboxIx, InboxPrefix), VaultIndex: primary,
+		Search: se, VaultRoot: fixtureVault, InboxRoot: inboxRoot, InboxIndex: inboxIx,
+		MaxBodyBytes: 200_000, Log: log,
+	}
+}
+
+func TestGetGraphVaultOnlyExcludesInbox(t *testing.T) {
+	tl := buildToolsWithInbox(t, map[string]string{
+		"draft.md": "# draft\n\nlinks to [[soul]]\n",
+	})
+
+	// the merged tool can root a graph at an inbox note
+	merged, err := tl.GetGraph(context.Background(), GetGraphIn{Path: "inbox/draft.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Root != "inbox/draft.md" {
+		t.Fatalf("merged root = %q", merged.Root)
+	}
+
+	// the vault-only tool refuses the same root outright
+	if _, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{Path: "inbox/draft.md"}); err == nil {
+		t.Fatal("expected error rooting a vault-only graph at an inbox note")
+	}
+
+	// and never surfaces an inbox node when rooted in the vault, even
+	// though that already held true before this tool existed (no
+	// cross-boundary edges yet) — asserted so a future change to that
+	// limitation can't silently leak inbox content in here too
+	vaultOnly, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{
+		Path: "engineering/basim/soul.md", Depth: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range vaultOnly.Nodes {
+		if n.Source == vault.SourceInbox {
+			t.Fatalf("vault-only graph leaked an inbox node: %+v", n)
+		}
+	}
+}
+
+func TestGetGraphVaultOnlyWorksWithoutInboxConfigured(t *testing.T) {
+	tl := testTools(t) // no inbox at all
+	out, err := tl.GetGraphVaultOnly(context.Background(), GetGraphIn{Path: "engineering/basim/soul.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Nodes) == 0 {
+		t.Fatal("expected a normal graph with no inbox configured")
+	}
+}
+
+func TestFindPathVaultOnlyExcludesInbox(t *testing.T) {
+	tl := buildToolsWithInbox(t, map[string]string{
+		"draft.md": "# draft\n\nlinks to [[soul]]\n",
+	})
+
+	// the merged tool accepts an inbox endpoint (even though, per the
+	// documented limitation, it won't find a cross-boundary route)
+	if _, err := tl.FindPath(context.Background(), FindPathIn{
+		From: "inbox/draft.md", To: "inbox/draft.md",
+	}); err != nil {
+		t.Fatalf("merged find_path should accept an inbox endpoint: %v", err)
+	}
+
+	// the vault-only tool refuses an inbox endpoint outright
+	if _, err := tl.FindPathVaultOnly(context.Background(), FindPathIn{
+		From: "inbox/draft.md", To: "engineering/basim/soul.md",
+	}); err == nil {
+		t.Fatal("expected error for an inbox endpoint in find_path_vault_only")
+	}
+
+	// ordinary vault-to-vault pathfinding still works
+	out, err := tl.FindPathVaultOnly(context.Background(), FindPathIn{
+		From: "engineering/basim/character.md", To: "engineering/basim/soul.md", Direction: "out",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Found || len(out.Path) != 2 {
+		t.Fatalf("path = %+v", out.Path)
 	}
 }

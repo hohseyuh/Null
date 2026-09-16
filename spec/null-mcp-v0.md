@@ -27,13 +27,15 @@ calls a tool.
 
 ## Tools
 
-Nine total: four mirror an HTTP route field-for-field (with one addition —
-`list_notes` and `search_notes` results carry `approx_tokens`,
-`size_bytes / 4`, a rough heuristic, so the model can budget a `get_note`
-call before making it); three are new read capabilities with no HTTP
-equivalent (`find_relatives`, `get_links`, `find_path`); two are writes,
-registered only when `NULL_INBOX_PATH` is configured (`create_note`,
-`write_note`).
+Eleven total: four mirror an HTTP route field-for-field (with one
+addition — `list_notes` and `search_notes` results carry
+`approx_tokens`, `size_bytes / 4`, a rough heuristic, so the model can
+budget a `get_note` call before making it); three are new read
+capabilities with no HTTP equivalent (`find_relatives`, `get_links`,
+`find_path`); two more are "vault only" companions to `get_graph` and
+`find_path` (`get_graph_vault_only`, `find_path_vault_only`), always
+registered regardless of inbox configuration; two are writes, registered
+only when `NULL_INBOX_PATH` is configured (`create_note`, `write_note`).
 
 Every tool result that carries a title runs it through the inbox label
 (see "Inbox" below) — this is not opt-in per call. A model reading any
@@ -92,6 +94,22 @@ wikilink was written on.
 | `depth` | int | 1–3, default 1 |
 | `direction` | string | `out` \| `in` \| `both` (default) |
 
+Includes inbox content: the root may itself be an inbox note, and inbox
+nodes appear wherever the traversal reaches them (which today, given the
+cross-boundary limitation below, only happens when the root itself is on
+the inbox side).
+
+### `get_graph_vault_only`
+
+Same shape and params as `get_graph`, restricted to the vault
+unconditionally — registered whether or not `NULL_INBOX_PATH` is set, and
+guarantees zero inbox exposure: an inbox-prefixed `path` is rejected as
+"no such note" before any traversal happens, never silently walked. Use
+this over `get_graph` when the caller specifically needs to know the
+answer holds regardless of whatever is currently sitting in the inbox —
+e.g. checking whether something is already established before drafting a
+new note about it.
+
 ### `find_relatives`
 
 No HTTP equivalent. Notes related by **folder and/or shared tags** —
@@ -132,6 +150,15 @@ not an error, the same way a zero-hit search isn't one.
 | `from`, `to` | string | required |
 | `depth` | int | max hops, 1–6, default 4 |
 | `direction` | string | `out` \| `in` \| `both` (default) |
+
+Either endpoint may be an inbox note.
+
+### `find_path_vault_only`
+
+Same shape and params as `find_path`, restricted to the vault
+unconditionally — registered whether or not `NULL_INBOX_PATH` is set.
+Either `from` or `to` being an inbox-prefixed path fails as "no such
+note," the same guarantee `get_graph_vault_only` makes.
 
 ### `create_note` / `write_note` — inbox only
 
