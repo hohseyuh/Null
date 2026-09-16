@@ -65,14 +65,39 @@ No editor, no JS, one stylesheet.
 ### MCP server
 
 For a language model to call the vault directly instead of going through
-HTTP — `list_notes`, `get_note`, `search_notes`, `get_graph`, the same
-four operations with the same guarantees (list/search never return
-bodies; every path is safety-checked; nothing writes). Full contract in
+HTTP. Nine tools: `list_notes`, `get_note`, `search_notes`, `get_graph`
+mirror the HTTP routes; `find_relatives` (folder/tag siblings),
+`get_links` (one note's outlinks+backlinks in one call), and `find_path`
+(shortest link chain between two notes) are new, read-only, no HTTP
+equivalent; `create_note`/`write_note` are writes, and only exist at all
+when `NULL_INBOX_PATH` is configured. Full contract in
 [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
 
 ```sh
 NULL_VAULT_PATH=/srv/null-vault go run ./cmd/nullmcp
 ```
+
+#### Inbox (optional — enables create_note/write_note)
+
+```sh
+NULL_VAULT_PATH=/srv/null-vault NULL_INBOX_PATH=/srv/null-inbox go run ./cmd/nullmcp
+```
+
+`NULL_INBOX_PATH` is a second, physically separate directory — never part
+of the `null-vault` git repo. It's the *only* thing any write tool ever
+opens read-write; `NULL_VAULT_PATH` stays exactly as read-only as it is
+in `nullapi`, unconditionally. Notes written there show up immediately
+(no restart, no race against the watcher) in every read tool, addressed
+as `inbox/<path>` and labeled — same shape as any other note, just with
+`source: "inbox"` and a `[inbox — draft, not yet reviewed or promoted]`
+suffix on the title, so a model can't mistake a draft for settled fact.
+
+Promoting a draft into the real vault is a human act, on purpose: review
+it, move it into `null-vault`, `git add && commit && push` yourself. No
+tool here does that step for you — see CLAUDE.md's "Inbox" section for
+why, and `spec/null-mcp-v0.md` for the one real limitation this has today
+(links between a draft and a real note don't appear as graph edges until
+the draft is promoted).
 
 Speaks stdio — point a client (Claude Desktop, Claude Code, etc.) at the
 binary as a subprocess, e.g. in Claude Desktop's config:

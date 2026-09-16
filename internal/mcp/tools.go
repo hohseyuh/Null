@@ -17,8 +17,10 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"path"
 	"slices"
 	"sort"
 	"strings"
@@ -30,12 +32,48 @@ import (
 
 // Tools holds the dependencies behind every tool call. It mirrors
 // api.Server in shape but speaks Go in, Go out — no HTTP.
+//
+// Index is a vault.Reader rather than a concrete *vault.Index so it can
+// be either a plain vault-only index or a vault.Combined merging in the
+// inbox. InboxRoot gates the write tools: empty means "no inbox
+// configured," and create_note/write_note are not registered at all
+// (see server.go) rather than registered and failing at call time.
 type Tools struct {
-	Index        *vault.Index
-	Search       *search.Searcher
-	VaultRoot    string
+	Index       vault.Reader
+	Search      *search.Searcher
+	InboxSearch *search.Searcher // nil disables inbox body search; see safeInboxPath
+	VaultRoot   string
+	InboxRoot   string // empty disables create_note/write_note
+	// InboxIndex is the concrete inbox index CreateNote/WriteNote refresh
+	// synchronously after a successful disk write, so a get_note right
+	// after a create_note never races the watcher's debounce window. Nil
+	// exactly when InboxRoot is empty.
+	InboxIndex   *vault.Index
 	MaxBodyBytes int64
 	Log          *slog.Logger
+}
+
+// InboxPrefix is the reserved namespace inbox notes are addressed under
+// in every tool argument and result — "inbox/foo.md" always means the
+// inbox, never a literal vault folder named "inbox". cmd/nullmcp passes
+// this exact value to vault.NewCombined so the two stay in lockstep.
+const InboxPrefix = "inbox/"
+
+// inboxLabel is appended to an inbox note's title in every tool result
+// that carries one. A word in the text a model is already reading is
+// harder to miss than a same-shaped extra JSON field — the Source field
+// is still there too, for anything that filters on it.
+const inboxLabel = " [inbox — draft, not yet reviewed or promoted]"
+
+// displayTitle returns n.Title, suffixed with inboxLabel when n came
+// from the inbox. Every tool output that shows a title runs it through
+// this, so the "not yet settled" signal is impossible to miss whether a
+// model is skimming a list or looking at one note.
+func displayTitle(n *vault.Note) string {
+	if n.Source == vault.SourceInbox {
+		return n.Title + inboxLabel
+	}
+	return n.Title
 }
 
 func (t *Tools) logResult(tool string, n int) {
@@ -52,6 +90,37 @@ func hasAllTags(have, want []string) bool {
 		}
 	}
 	return true
+}
+
+// safeMergedPath validates a path exactly as any tool result returns
+// it — vault-relative as-is, or InboxPrefix-prefixed — against whichever
+// physical root actually owns it. This mirrors how vault.Combined itself
+// routes a merged path, so safety is enforced before the path reaches
+// the index at all, on the correct root either way.
+func (t *Tools) safeMergedPath(merged string) (string, error) {
+	if rel, ok := strings.CutPrefix(merged, InboxPrefix); ok {
+		if t.InboxRoot == "" {
+			return "", fmt.Errorf("inbox is not configured on this server")
+		}
+		safeRel, err := vault.SafeRequestPath(t.InboxRoot, rel)
+		if err != nil {
+			return "", err
+		}
+		return InboxPrefix + safeRel, nil
+	}
+	return vault.SafeRequestPath(t.VaultRoot, merged)
+}
+
+// safeInboxPath validates a path that must name something in the
+// inbox — used only by create_note and write_note, the sole tools
+// allowed to touch disk, and only ever under InboxRoot. Returns the
+// physical inbox-relative path with InboxPrefix stripped.
+func (t *Tools) safeInboxPath(merged string) (string, error) {
+	rel, ok := strings.CutPrefix(merged, InboxPrefix)
+	if !ok {
+		return "", fmt.Errorf("path must start with %q — the inbox is the only writable location", InboxPrefix)
+	}
+	return vault.SafeRequestPath(t.InboxRoot, rel)
 }
 
 // ListNotesIn is the input to list_notes.
@@ -77,9 +146,10 @@ type NoteSummary struct {
 	// ApproxTokens is a rough size_bytes/4 heuristic (English prose
 	// averages ~4 bytes/token). Use it to budget get_note calls before
 	// making them, not as an exact count.
-	ApproxTokens  int64 `json:"approx_tokens"`
-	OutlinkCount  int   `json:"outlink_count"`
-	BacklinkCount int   `json:"backlink_count"`
+	ApproxTokens  int64  `json:"approx_tokens"`
+	OutlinkCount  int    `json:"outlink_count"`
+	BacklinkCount int    `json:"backlink_count"`
+	Source        string `json:"source"` // "vault" or "inbox" — see Title
 }
 
 // ListNotesOut is the output of list_notes.
@@ -176,7 +246,7 @@ func (t *Tools) summarize(n *vault.Note) NoteSummary {
 	}
 	return NoteSummary{
 		Path:          n.Path,
-		Title:         n.Title,
+		Title:         displayTitle(n),
 		Tags:          tags,
 		Frontmatter:   n.Frontmatter,
 		UpdatedAt:     n.UpdatedAt,
@@ -184,6 +254,7 @@ func (t *Tools) summarize(n *vault.Note) NoteSummary {
 		ApproxTokens:  n.SizeBytes / 4,
 		OutlinkCount:  len(n.Outlinks),
 		BacklinkCount: len(t.Index.Backlinks(n.Path)),
+		Source:        n.Source,
 	}
 }
 
@@ -202,6 +273,8 @@ type GetNoteIn struct {
 // body.
 type GetNoteOut struct {
 	Path        string          `json:"path"`
+	Title       string          `json:"title"`
+	Source      string          `json:"source"` // "vault" or "inbox" — see Title
 	Frontmatter map[string]any  `json:"frontmatter"`
 	Body        string          `json:"body,omitempty"`
 	Headings    []vault.Heading `json:"headings"`
@@ -214,7 +287,7 @@ type GetNoteOut struct {
 // MaxBodyBytes; past that it errors and points the caller at section,
 // the same contract as the HTTP API's 413.
 func (t *Tools) GetNote(_ context.Context, in GetNoteIn) (GetNoteOut, error) {
-	rel, err := vault.SafeRequestPath(t.VaultRoot, in.Path)
+	rel, err := t.safeMergedPath(in.Path)
 	if err != nil {
 		return GetNoteOut{}, fmt.Errorf("invalid path %q: %w", in.Path, err)
 	}
@@ -239,6 +312,8 @@ func (t *Tools) GetNote(_ context.Context, in GetNoteIn) (GetNoteOut, error) {
 
 	out := GetNoteOut{
 		Path:        n.Path,
+		Title:       displayTitle(n),
+		Source:      n.Source,
 		Frontmatter: n.Frontmatter,
 		Headings:    n.Headings,
 		UpdatedAt:   n.UpdatedAt,
@@ -300,6 +375,7 @@ type SearchNotesIn struct {
 type SearchHit struct {
 	Path    string         `json:"path"`
 	Title   string         `json:"title"`
+	Source  string         `json:"source"` // "vault" or "inbox" — see Title
 	Score   float64        `json:"score"`
 	Matches []search.Match `json:"matches"`
 }
@@ -346,24 +422,46 @@ func (t *Tools) SearchNotes(ctx context.Context, in SearchNotesIn) (SearchNotesO
 	hits := map[string]*SearchHit{}
 
 	if mode == "body" || mode == "both" {
+		type rawHit struct {
+			path    string
+			matches []search.Match
+		}
+		var raw []rawHit
+
 		results, err := t.Search.Search(ctx, in.Query)
 		if err != nil {
 			return SearchNotesOut{}, fmt.Errorf("search backend: %w", err)
 		}
-		maxCount := 0
 		for _, res := range results {
-			if len(res.Matches) > maxCount {
-				maxCount = len(res.Matches)
+			raw = append(raw, rawHit{path: res.Path, matches: res.Matches})
+		}
+		// Ripgrep only sees NULL_VAULT_PATH; the inbox is a second
+		// process over a second root, merged here by prefixing its
+		// paths the same way Combined does for every other read.
+		if t.InboxSearch != nil {
+			inboxResults, err := t.InboxSearch.Search(ctx, in.Query)
+			if err != nil {
+				return SearchNotesOut{}, fmt.Errorf("inbox search backend: %w", err)
+			}
+			for _, res := range inboxResults {
+				raw = append(raw, rawHit{path: InboxPrefix + res.Path, matches: res.Matches})
 			}
 		}
-		for _, res := range results {
-			if !visible(res.Path) {
+
+		maxCount := 0
+		for _, rh := range raw {
+			if len(rh.matches) > maxCount {
+				maxCount = len(rh.matches)
+			}
+		}
+		for _, rh := range raw {
+			if !visible(rh.path) {
 				continue
 			}
-			n, _ := t.Index.Get(res.Path)
-			hits[res.Path] = &SearchHit{
-				Path: res.Path, Title: n.Title,
-				Score: float64(len(res.Matches)) / float64(maxCount), Matches: res.Matches,
+			n, _ := t.Index.Get(rh.path)
+			hits[rh.path] = &SearchHit{
+				Path: rh.path, Title: displayTitle(n), Source: n.Source,
+				Score: float64(len(rh.matches)) / float64(maxCount), Matches: rh.matches,
 			}
 		}
 	}
@@ -411,6 +509,7 @@ type GraphNodeOut struct {
 	Path     string `json:"path"`
 	Title    string `json:"title"`
 	Distance int    `json:"distance"`
+	Source   string `json:"source"` // "vault" or "inbox" — see Title
 }
 
 // GraphEdgeOut is one link in a get_graph result, carrying the line it
@@ -433,7 +532,7 @@ type GetGraphOut struct {
 // not just that they are. Cheaper than fetching notes to rediscover
 // their relationships.
 func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) {
-	rel, err := vault.SafeRequestPath(t.VaultRoot, in.Path)
+	rel, err := t.safeMergedPath(in.Path)
 	if err != nil {
 		return GetGraphOut{}, fmt.Errorf("invalid path %q: %w", in.Path, err)
 	}
@@ -464,11 +563,371 @@ func (t *Tools) GetGraph(_ context.Context, in GetGraphIn) (GetGraphOut, error) 
 		Edges: make([]GraphEdgeOut, 0, len(g.Edges)),
 	}
 	for _, n := range g.Nodes {
-		out.Nodes = append(out.Nodes, GraphNodeOut{Path: n.Path, Title: n.Title, Distance: n.Distance})
+		title := n.Title
+		if n.Source == vault.SourceInbox {
+			title += inboxLabel
+		}
+		out.Nodes = append(out.Nodes, GraphNodeOut{Path: n.Path, Title: title, Distance: n.Distance, Source: n.Source})
 	}
 	for _, e := range g.Edges {
 		out.Edges = append(out.Edges, GraphEdgeOut{From: e.From, To: e.To, Context: e.Context})
 	}
 	t.logResult("get_graph", len(out.Nodes))
 	return out, nil
+}
+
+// FindRelativesIn is the input to find_relatives.
+type FindRelativesIn struct {
+	Path  string `json:"path" jsonschema:"required; the note to find relatives of"`
+	By    string `json:"by,omitempty" jsonschema:"'folder', 'tags', or 'both' (default) — what counts as related"`
+	Limit int    `json:"limit,omitempty" jsonschema:"1-100, default 20"`
+}
+
+// Relative is one note related to the queried one by folder and/or tags —
+// not by links. get_links and get_graph cover the linked sense of
+// "related"; this one is metadata-based.
+type Relative struct {
+	Path       string   `json:"path"`
+	Title      string   `json:"title"`
+	Source     string   `json:"source"` // "vault" or "inbox" — see Title
+	SameFolder bool     `json:"same_folder"`
+	SharedTags []string `json:"shared_tags,omitempty"`
+}
+
+// FindRelativesOut is the output of find_relatives.
+type FindRelativesOut struct {
+	Path      string     `json:"path"`
+	Relatives []Relative `json:"relatives"`
+}
+
+// FindRelatives finds notes related to one note by folder and/or shared
+// tags — organizational or topical proximity, distinct from the wikilink
+// graph get_graph and get_links traverse. Two notes can be relatives
+// with zero links between them, and two linked notes need not be
+// relatives.
+func (t *Tools) FindRelatives(_ context.Context, in FindRelativesIn) (FindRelativesOut, error) {
+	rel, err := t.safeMergedPath(in.Path)
+	if err != nil {
+		return FindRelativesOut{}, fmt.Errorf("invalid path %q: %w", in.Path, err)
+	}
+	n, ok := t.Index.Get(rel)
+	if !ok {
+		return FindRelativesOut{}, fmt.Errorf("no such note: %s", rel)
+	}
+
+	by := in.By
+	if by == "" {
+		by = "both"
+	}
+	if by != "folder" && by != "tags" && by != "both" {
+		return FindRelativesOut{}, fmt.Errorf("by must be 'folder', 'tags', or 'both'")
+	}
+	limit := 20
+	if in.Limit != 0 {
+		if in.Limit < 1 {
+			return FindRelativesOut{}, fmt.Errorf("limit must be a positive integer")
+		}
+		limit = min(in.Limit, 100)
+	}
+
+	folder := path.Dir(n.Path)
+	var relatives []Relative
+	for _, o := range t.Index.All() {
+		if o.Path == n.Path {
+			continue
+		}
+		sameFolder := path.Dir(o.Path) == folder
+		var shared []string
+		for _, tag := range o.Tags {
+			if slices.Contains(n.Tags, tag) {
+				shared = append(shared, tag)
+			}
+		}
+		match := false
+		switch by {
+		case "folder":
+			match = sameFolder
+		case "tags":
+			match = len(shared) > 0
+		case "both":
+			match = sameFolder || len(shared) > 0
+		}
+		if !match {
+			continue
+		}
+		relatives = append(relatives, Relative{
+			Path: o.Path, Title: displayTitle(o), Source: o.Source,
+			SameFolder: sameFolder, SharedTags: shared,
+		})
+	}
+
+	sort.Slice(relatives, func(i, j int) bool {
+		if len(relatives[i].SharedTags) != len(relatives[j].SharedTags) {
+			return len(relatives[i].SharedTags) > len(relatives[j].SharedTags)
+		}
+		if relatives[i].SameFolder != relatives[j].SameFolder {
+			return relatives[i].SameFolder // same-folder sorts first among ties
+		}
+		return relatives[i].Path < relatives[j].Path
+	})
+	if len(relatives) > limit {
+		relatives = relatives[:limit]
+	}
+	if relatives == nil {
+		relatives = []Relative{}
+	}
+
+	t.logResult("find_relatives", len(relatives))
+	return FindRelativesOut{Path: rel, Relatives: relatives}, nil
+}
+
+// GetLinksIn is the input to get_links.
+type GetLinksIn struct {
+	Path string `json:"path" jsonschema:"required; the note to list links for"`
+}
+
+// LinkedNote is one end of a link, in or out, with the context line the
+// wikilink was written on.
+type LinkedNote struct {
+	Path    string `json:"path"`
+	Title   string `json:"title"`
+	Source  string `json:"source"` // "vault" or "inbox" — see Title
+	Context string `json:"context"`
+}
+
+// GetLinksOut is the output of get_links — one note's direct connections,
+// both directions, in a single call. Equivalent to get_graph(path,
+// depth=1, direction=both) split into its two directions; use get_graph
+// instead for anything past one hop.
+type GetLinksOut struct {
+	Path      string       `json:"path"`
+	Outlinks  []LinkedNote `json:"outlinks"`
+	Backlinks []LinkedNote `json:"backlinks"`
+}
+
+// GetLinks mirrors get_graph at depth 1 but returns outlinks and
+// backlinks as two separate, directly labeled lists instead of one
+// merged node/edge set — cheaper to read when direction is what matters
+// and depth doesn't.
+func (t *Tools) GetLinks(_ context.Context, in GetLinksIn) (GetLinksOut, error) {
+	rel, err := t.safeMergedPath(in.Path)
+	if err != nil {
+		return GetLinksOut{}, fmt.Errorf("invalid path %q: %w", in.Path, err)
+	}
+	if _, ok := t.Index.Get(rel); !ok {
+		return GetLinksOut{}, fmt.Errorf("no such note: %s", rel)
+	}
+
+	out := GetLinksOut{Path: rel, Outlinks: []LinkedNote{}, Backlinks: []LinkedNote{}}
+	for _, e := range t.Index.Outlinks(rel) {
+		ln := LinkedNote{Path: e.To, Context: e.Context}
+		if n, ok := t.Index.Get(e.To); ok {
+			ln.Title, ln.Source = displayTitle(n), n.Source
+		}
+		out.Outlinks = append(out.Outlinks, ln)
+	}
+	for _, e := range t.Index.Backlinks(rel) {
+		ln := LinkedNote{Path: e.From, Context: e.Context}
+		if n, ok := t.Index.Get(e.From); ok {
+			ln.Title, ln.Source = displayTitle(n), n.Source
+		}
+		out.Backlinks = append(out.Backlinks, ln)
+	}
+
+	t.logResult("get_links", len(out.Outlinks)+len(out.Backlinks))
+	return out, nil
+}
+
+// FindPathIn is the input to find_path.
+type FindPathIn struct {
+	From      string `json:"from" jsonschema:"required; starting note"`
+	To        string `json:"to" jsonschema:"required; target note"`
+	Depth     int    `json:"depth,omitempty" jsonschema:"max hops to search, 1-6, default 4"`
+	Direction string `json:"direction,omitempty" jsonschema:"'out', 'in', or 'both' (default) — link directions to follow while searching"`
+}
+
+// PathStep is one note along a found path. Via is the context line of
+// the link taken to reach this step from the previous one; empty on the
+// first step, which is From itself.
+type PathStep struct {
+	Path   string `json:"path"`
+	Title  string `json:"title"`
+	Source string `json:"source"` // "vault" or "inbox" — see Title
+	Via    string `json:"via,omitempty"`
+}
+
+// FindPathOut is the output of find_path. Found is false, with an empty
+// Path, when no route exists within Depth hops — not an error, the same
+// way a zero-result search isn't one.
+type FindPathOut struct {
+	Found bool       `json:"found"`
+	Path  []PathStep `json:"path"`
+}
+
+// FindPath finds the shortest chain of wikilinks connecting two notes —
+// "how, if at all, are these related" for two specific notes, as opposed
+// to get_graph's "what's in this note's neighborhood." Like get_graph,
+// it does not cross the vault/inbox boundary (see package doc on
+// vault.Combined); a path through a promoted note works once promoted.
+func (t *Tools) FindPath(_ context.Context, in FindPathIn) (FindPathOut, error) {
+	fromRel, err := t.safeMergedPath(in.From)
+	if err != nil {
+		return FindPathOut{}, fmt.Errorf("invalid from %q: %w", in.From, err)
+	}
+	toRel, err := t.safeMergedPath(in.To)
+	if err != nil {
+		return FindPathOut{}, fmt.Errorf("invalid to %q: %w", in.To, err)
+	}
+	if _, ok := t.Index.Get(fromRel); !ok {
+		return FindPathOut{}, fmt.Errorf("no such note: %s", fromRel)
+	}
+	if _, ok := t.Index.Get(toRel); !ok {
+		return FindPathOut{}, fmt.Errorf("no such note: %s", toRel)
+	}
+
+	depth := 4
+	if in.Depth != 0 {
+		if in.Depth < 1 || in.Depth > 6 {
+			return FindPathOut{}, fmt.Errorf("depth must be between 1 and 6")
+		}
+		depth = in.Depth
+	}
+	direction := in.Direction
+	if direction == "" {
+		direction = "both"
+	}
+	if direction != "out" && direction != "in" && direction != "both" {
+		return FindPathOut{}, fmt.Errorf("direction must be 'out', 'in', or 'both'")
+	}
+
+	type pred struct{ prev, via string }
+	preds := map[string]pred{fromRel: {}}
+	frontier := []string{fromRel}
+	for d := 0; d < depth && len(frontier) > 0; d++ {
+		var next []string
+		for _, p := range frontier {
+			var edges []vault.Edge
+			if direction == "out" || direction == "both" {
+				edges = append(edges, t.Index.Outlinks(p)...)
+			}
+			if direction == "in" || direction == "both" {
+				edges = append(edges, t.Index.Backlinks(p)...)
+			}
+			for _, e := range edges {
+				other := e.To
+				if other == p {
+					other = e.From
+				}
+				if _, seen := preds[other]; seen {
+					continue
+				}
+				preds[other] = pred{prev: p, via: e.Context}
+				next = append(next, other)
+			}
+		}
+		frontier = next
+	}
+
+	if _, ok := preds[toRel]; !ok {
+		t.logResult("find_path", 0)
+		return FindPathOut{Found: false, Path: []PathStep{}}, nil
+	}
+
+	var chain []string
+	for cur := toRel; ; {
+		chain = append(chain, cur)
+		if cur == fromRel {
+			break
+		}
+		cur = preds[cur].prev
+	}
+	slices.Reverse(chain)
+
+	steps := make([]PathStep, len(chain))
+	for i, p := range chain {
+		n, _ := t.Index.Get(p)
+		steps[i] = PathStep{Path: p, Title: displayTitle(n), Source: n.Source}
+		if i > 0 {
+			steps[i].Via = preds[p].via
+		}
+	}
+
+	t.logResult("find_path", len(steps))
+	return FindPathOut{Found: true, Path: steps}, nil
+}
+
+// CreateNoteIn is the input to create_note.
+type CreateNoteIn struct {
+	Path        string         `json:"path" jsonschema:"required; must start with 'inbox/' — the only writable location"`
+	Frontmatter map[string]any `json:"frontmatter,omitempty"`
+	Body        string         `json:"body" jsonschema:"the markdown body"`
+}
+
+// CreateNoteOut is the output of create_note.
+type CreateNoteOut struct {
+	Path string `json:"path"`
+}
+
+// CreateNote writes a brand-new note into the inbox — the only location
+// any tool in this server can write to; the vault itself is never
+// touched. Fails if a note already exists at Path; use write_note to
+// overwrite one deliberately. The new note is immediately visible to
+// every read tool, labeled as inbox, exactly like any other note except
+// for that label.
+func (t *Tools) CreateNote(_ context.Context, in CreateNoteIn) (CreateNoteOut, error) {
+	if t.InboxRoot == "" {
+		return CreateNoteOut{}, fmt.Errorf("inbox is not configured on this server")
+	}
+	physRel, err := t.safeInboxPath(in.Path)
+	if err != nil {
+		return CreateNoteOut{}, err
+	}
+	if err := vault.CreateNote(t.InboxRoot, physRel, in.Frontmatter, in.Body); err != nil {
+		if errors.Is(err, vault.ErrNoteExists) {
+			return CreateNoteOut{}, fmt.Errorf(
+				"a note already exists at %s%s; use write_note to overwrite it deliberately", InboxPrefix, physRel)
+		}
+		return CreateNoteOut{}, err
+	}
+	t.InboxIndex.Refresh(physRel) // make it visible now, not after the watcher's debounce
+	merged := InboxPrefix + physRel
+	t.logResult("create_note", len(in.Body))
+	return CreateNoteOut{Path: merged}, nil
+}
+
+// WriteNoteIn is the input to write_note.
+type WriteNoteIn struct {
+	Path        string         `json:"path" jsonschema:"required; must start with 'inbox/'; the note must already exist"`
+	Frontmatter map[string]any `json:"frontmatter,omitempty"`
+	Body        string         `json:"body" jsonschema:"the full new body, replacing the old one wholesale"`
+}
+
+// WriteNoteOut is the output of write_note.
+type WriteNoteOut struct {
+	Path string `json:"path"`
+}
+
+// WriteNote overwrites an existing inbox note wholesale — the given
+// frontmatter and body replace whatever was there, entirely. Fails if
+// nothing exists yet at Path; use create_note for a new note. Like
+// CreateNote, this only ever touches the inbox, never the vault.
+func (t *Tools) WriteNote(_ context.Context, in WriteNoteIn) (WriteNoteOut, error) {
+	if t.InboxRoot == "" {
+		return WriteNoteOut{}, fmt.Errorf("inbox is not configured on this server")
+	}
+	physRel, err := t.safeInboxPath(in.Path)
+	if err != nil {
+		return WriteNoteOut{}, err
+	}
+	if err := vault.WriteNote(t.InboxRoot, physRel, in.Frontmatter, in.Body); err != nil {
+		if errors.Is(err, vault.ErrNoteNotFound) {
+			return WriteNoteOut{}, fmt.Errorf(
+				"no note exists yet at %s%s; use create_note first", InboxPrefix, physRel)
+		}
+		return WriteNoteOut{}, err
+	}
+	t.InboxIndex.Refresh(physRel) // make the change visible now, not after the watcher's debounce
+	merged := InboxPrefix + physRel
+	t.logResult("write_note", len(in.Body))
+	return WriteNoteOut{Path: merged}, nil
 }

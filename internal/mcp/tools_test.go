@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -189,5 +190,114 @@ func TestGetGraph(t *testing.T) {
 	}
 	if _, err := tl.GetGraph(context.Background(), GetGraphIn{Path: "nope.md"}); err == nil {
 		t.Fatal("expected error for unknown note")
+	}
+}
+
+func TestFindRelatives(t *testing.T) {
+	tl := testTools(t)
+
+	// character.md shares folder and the "basim" tag with soul.md
+	out, err := tl.FindRelatives(context.Background(), FindRelativesIn{Path: "engineering/basim/character.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *Relative
+	for i := range out.Relatives {
+		if out.Relatives[i].Path == "engineering/basim/soul.md" {
+			found = &out.Relatives[i]
+		}
+	}
+	if found == nil || !found.SameFolder || !slices.Contains(found.SharedTags, "basim") {
+		t.Fatalf("expected soul.md as a same-folder, shared-tag relative: %+v", out.Relatives)
+	}
+
+	// by=tags excludes same-folder-only notes with no shared tag
+	byTags, err := tl.FindRelatives(context.Background(), FindRelativesIn{Path: "index.md", By: "tags"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range byTags.Relatives {
+		if len(r.SharedTags) == 0 {
+			t.Fatalf("by=tags returned a note with no shared tag: %+v", r)
+		}
+	}
+
+	if _, err := tl.FindRelatives(context.Background(), FindRelativesIn{Path: "nope.md"}); err == nil {
+		t.Fatal("expected error for unknown note")
+	}
+	if _, err := tl.FindRelatives(context.Background(), FindRelativesIn{Path: "plain.md", By: "sideways"}); err == nil {
+		t.Fatal("expected error for bad by value")
+	}
+}
+
+func TestGetLinks(t *testing.T) {
+	tl := testTools(t)
+
+	out, err := tl.GetLinks(context.Background(), GetLinksIn{Path: "engineering/basim/soul.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Outlinks) != 3 { // character (x2 lines) + index
+		t.Fatalf("outlinks = %+v", out.Outlinks)
+	}
+	if len(out.Backlinks) != 3 { // character, index, barzakh
+		t.Fatalf("backlinks = %+v", out.Backlinks)
+	}
+	for _, l := range out.Outlinks {
+		if l.Context == "" || l.Title == "" {
+			t.Fatalf("outlink missing context/title: %+v", l)
+		}
+	}
+
+	if _, err := tl.GetLinks(context.Background(), GetLinksIn{Path: "nope.md"}); err == nil {
+		t.Fatal("expected error for unknown note")
+	}
+}
+
+func TestFindPath(t *testing.T) {
+	tl := testTools(t)
+
+	// character.md -> soul.md is a direct out-link
+	out, err := tl.FindPath(context.Background(), FindPathIn{
+		From: "engineering/basim/character.md", To: "engineering/basim/soul.md", Direction: "out",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Found || len(out.Path) != 2 {
+		t.Fatalf("path = %+v", out.Path)
+	}
+	if out.Path[0].Path != "engineering/basim/character.md" || out.Path[1].Path != "engineering/basim/soul.md" {
+		t.Fatalf("path order wrong: %+v", out.Path)
+	}
+	if out.Path[0].Via != "" || out.Path[1].Via == "" {
+		t.Fatalf("via should be empty on the first step only: %+v", out.Path)
+	}
+
+	// same note, trivial path of length 1
+	trivial, err := tl.FindPath(context.Background(), FindPathIn{From: "plain.md", To: "plain.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trivial.Found || len(trivial.Path) != 1 {
+		t.Fatalf("trivial path = %+v", trivial.Path)
+	}
+
+	// no route within the depth searched is Found:false, not an error
+	unreachable, err := tl.FindPath(context.Background(), FindPathIn{
+		From: "malformed.md", To: "engineering/basim/soul.md",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unreachable.Found {
+		t.Fatalf("expected no path, got %+v", unreachable.Path)
+	}
+
+	if _, err := tl.FindPath(context.Background(), FindPathIn{From: "nope.md", To: "plain.md"}); err == nil {
+		t.Fatal("expected error for unknown from")
+	}
+	if _, err := tl.FindPath(context.Background(), FindPathIn{From: "plain.md", To: "plain.md", Depth: 7}); err == nil {
+		t.Fatal("expected error for depth > 6")
 	}
 }

@@ -1,11 +1,21 @@
 // Command nullmcp exposes the vault as Model Context Protocol tools —
-// list_notes, get_note, search_notes, get_graph — over stdio, for a
-// local LLM client (Claude Desktop, Claude Code, a future Basim process)
-// to launch as a subprocess.
+// list_notes, get_note, search_notes, get_graph, find_relatives,
+// get_links, find_path, and (when NULL_INBOX_PATH is set) create_note
+// and write_note — over stdio, for a local LLM client (Claude Desktop,
+// Claude Code, a future Basim process) to launch as a subprocess.
 //
 // Same vault, same vault/search packages, same path-safety and body-cap
 // rules as nullapi: this is a second presentation of the read API, not a
 // second implementation of it.
+//
+// Writes: the vault at NULL_VAULT_PATH is never opened for anything but
+// reading, full stop — that non-negotiable is unchanged. The one
+// sanctioned exception is a second, physically separate directory,
+// NULL_INBOX_PATH: create_note/write_note touch only that root. Inbox
+// notes are merged into every read tool's results, addressed as
+// "inbox/<path>" and labeled, so a model sees its own drafts — but
+// promoting a draft into the real vault stays a human, git-mediated act
+// this server never performs. See spec/null-mcp-v0.md.
 //
 // Auth: stdio's trust boundary is the OS process — whoever can spawn this
 // binary already has the access a bearer token would gate over HTTP, so
@@ -24,6 +34,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -37,6 +48,7 @@ import (
 
 type config struct {
 	vaultPath     string
+	inboxPath     string // empty disables create_note/write_note and inbox visibility
 	maxBodyBytes  int64
 	inspectorAddr string // empty disables the inspector
 }
@@ -47,18 +59,27 @@ type config struct {
 func loadConfig() (config, error) {
 	cfg := config{
 		vaultPath:     os.Getenv("NULL_VAULT_PATH"),
+		inboxPath:     os.Getenv("NULL_INBOX_PATH"),
 		maxBodyBytes:  200_000,
 		inspectorAddr: os.Getenv("NULL_MCP_INSPECTOR_ADDR"),
 	}
 	if cfg.vaultPath == "" {
 		return cfg, errors.New("NULL_VAULT_PATH is required")
 	}
-	info, err := os.Stat(cfg.vaultPath)
-	if err != nil {
-		return cfg, fmt.Errorf("NULL_VAULT_PATH: %w", err)
+	if err := requireDir("NULL_VAULT_PATH", cfg.vaultPath); err != nil {
+		return cfg, err
 	}
-	if !info.IsDir() {
-		return cfg, fmt.Errorf("NULL_VAULT_PATH: %s is not a directory", cfg.vaultPath)
+	if cfg.inboxPath != "" {
+		if err := requireDir("NULL_INBOX_PATH", cfg.inboxPath); err != nil {
+			return cfg, err
+		}
+		// A vault-side top-level "inbox/" would collide with the
+		// reserved merged namespace (see internal/mcp.InboxPrefix) —
+		// fail loudly at boot rather than silently shadowing real notes.
+		if info, err := os.Stat(filepath.Join(cfg.vaultPath, "inbox")); err == nil && info.IsDir() {
+			return cfg, fmt.Errorf(
+				"NULL_VAULT_PATH has a top-level 'inbox/' directory, which collides with the reserved inbox namespace; rename it")
+		}
 	}
 	if v := os.Getenv("NULL_MAX_BODY_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -68,6 +89,17 @@ func loadConfig() (config, error) {
 		cfg.maxBodyBytes = n
 	}
 	return cfg, nil
+}
+
+func requireDir(envVar, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", envVar, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s: %s is not a directory", envVar, path)
+	}
+	return nil
 }
 
 func main() {
@@ -90,21 +122,50 @@ func run(log *slog.Logger) error {
 		return err // missing rg is a startup error, never a runtime failure
 	}
 
-	ix := vault.NewIndex(cfg.vaultPath, log)
-	if err := ix.Build(); err != nil {
+	vaultIndex := vault.NewIndex(cfg.vaultPath, log)
+	if err := vaultIndex.Build(); err != nil {
 		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	watcher, err := vault.NewWatcher(ix, 200*time.Millisecond)
+	vaultWatcher, err := vault.NewWatcher(vaultIndex, 200*time.Millisecond)
 	if err != nil {
 		return err
 	}
-	go watcher.Run(ctx)
+	go vaultWatcher.Run(ctx)
 
-	server := nullmcp.NewServer(ix, searcher, cfg.vaultPath, cfg.maxBodyBytes, log)
+	// Reader defaults to the plain vault index; wiring in the inbox
+	// below, when configured, replaces it with a vault.Combined that
+	// merges the two — every read tool sees whichever Reader ends up
+	// here, unchanged code either way.
+	var index vault.Reader = vaultIndex
+	var inboxSearcher *search.Searcher
+	var inboxIndex *vault.Index
+
+	if cfg.inboxPath != "" {
+		inboxSearcher, err = search.New(cfg.inboxPath)
+		if err != nil {
+			return fmt.Errorf("inbox search: %w", err)
+		}
+
+		inboxIndex = vault.NewIndex(cfg.inboxPath, log)
+		inboxIndex.Source = vault.SourceInbox
+		if err := inboxIndex.Build(); err != nil {
+			return err
+		}
+		inboxWatcher, err := vault.NewWatcher(inboxIndex, 200*time.Millisecond)
+		if err != nil {
+			return err
+		}
+		go inboxWatcher.Run(ctx)
+
+		index = vault.NewCombined(vaultIndex, inboxIndex, nullmcp.InboxPrefix)
+		log.Info("inbox configured", "path", cfg.inboxPath, "notes", inboxIndex.Len())
+	}
+
+	server := nullmcp.NewServer(index, searcher, inboxSearcher, inboxIndex, cfg.vaultPath, cfg.inboxPath, cfg.maxBodyBytes, log)
 
 	if cfg.inspectorAddr != "" {
 		if err := startInspector(ctx, server, cfg.inspectorAddr, log); err != nil {
@@ -112,7 +173,7 @@ func run(log *slog.Logger) error {
 		}
 	}
 
-	log.Info("mcp server starting", "vault", cfg.vaultPath, "notes", ix.Len())
+	log.Info("mcp server starting", "vault", cfg.vaultPath, "notes", index.Len())
 	if err := server.Run(ctx, &sdkmcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("mcp server: %w", err)
 	}

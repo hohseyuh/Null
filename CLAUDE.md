@@ -29,11 +29,19 @@ Consequence worth knowing: **`git pull` is the reindex trigger.** The fsnotify w
 These are architectural commitments, not preferences. If a change would violate one, stop and say so rather than working around it.
 
 1. **Never invent a storage format.** Markdown files on disk are canonical. No database of record, no proprietary index, no note that exists only in the server. If this server is deleted, nothing is lost.
-2. **Never write to the vault.** v0 is read-only, enforced at the filesystem layer (open files `O_RDONLY`), not merely by absence of routes.
+2. **Never write to the vault.** `NULL_VAULT_PATH` is read-only, enforced at the filesystem layer (open files `O_RDONLY`), not merely by absence of routes — true of `nullapi` unconditionally and of `nullmcp` even with the inbox enabled. The one sanctioned exception, added for the MCP tools, is a second, physically separate directory (`NULL_INBOX_PATH`) that `create_note`/`write_note` may open read-write — never the vault itself. See "Inbox" below; this is a scoped exception to the rule, not a repeal of it.
 3. **Never return a body that wasn't explicitly requested.** `/notes` and `/search` return metadata and snippets only. Bodies come from `GET /notes/{path}` alone. This is the rule that keeps a 2,000-note vault from blowing an LLM context window.
 4. **Path is the identity.** No UUIDs, no surrogate keys. `engineering/basim/soul.md` addresses that note everywhere, forever.
 5. **Never touch dotfiles or dot-directories.** `.git/` above all. Excluded from indexing and unreachable via any route.
 6. **The renderer shares the index.** It reads the same in-memory structures as the API — it does not call the API over HTTP, and it does not maintain a second parse. One process, two presentations.
+
+## Inbox
+
+`nullmcp` (only — `nullapi`/the renderer don't touch this) can be pointed at a second directory via `NULL_INBOX_PATH`, physically separate from `NULL_VAULT_PATH` and never part of the `null-vault` git repo. It exists so an LLM working through the MCP tools has somewhere to draft: `create_note`/`write_note` are the only writes anywhere in this codebase, and they only ever open files under `NULL_INBOX_PATH`.
+
+Inbox notes are merged into every MCP read tool's results via `vault.Combined` (`internal/vault/combined.go`), addressed as `inbox/<path>` — a reserved namespace, so a vault folder literally named `inbox/` is not allowed (boot fails loudly if one exists) — and carry `source: "inbox"` plus a title suffix in every tool result, so a model can never mistake a draft for settled vault content. Cross-boundary link resolution (a draft linking to a real note, or back) is a known, documented limitation: each side's index resolves links only within its own note set, so such a link becomes a real graph edge only once the note is promoted.
+
+**Promotion is not a feature of this codebase.** Moving a reviewed inbox note into `null-vault` and running `git add && commit && push` is a human act, same as authoring any other note — see "What this is" above. No tool here does it, and none should be added that does; that would be writing to the vault, which non-negotiable #2 forbids without exception. Full contract in `spec/null-mcp-v0.md`.
 
 ## Stack
 
@@ -56,6 +64,8 @@ internal/vault/           parse, index, watch — the core
   note.go                 Note struct, frontmatter + heading extraction
   index.go                in-memory index, path→Note, link graph
   watcher.go              fsnotify, incremental reparse
+  combined.go             merges a vault Index + inbox Index into one Reader
+  write.go                CreateNote/WriteNote — the only writes anywhere, inbox-only
 internal/api/             handlers, middleware, DTOs
   routes.go               chi router
   notes.go, search.go, graph.go
@@ -95,7 +105,7 @@ Every path from a request goes through one function before touching disk: reject
 
 ## Deliberately absent from v0
 
-Writes of any kind · in-browser editing · embeddings/RAG/chunking · a graph visualization · users, roles, sharing · pagination beyond a cursor · rate limiting · metrics beyond request logs · any JS build step.
+Writes to the vault, of any kind, by any tool — the inbox (see above) is a scoped exception for drafts, physically outside the vault, never a back door into it · in-browser editing · embeddings/RAG/chunking · a graph visualization · users, roles, sharing · pagination beyond a cursor · rate limiting · metrics beyond request logs · any JS build step · a tool that promotes an inbox note into the vault — that stays a human's `git commit`, always.
 
 The renderer is a **reader**. The moment it grows a text box it has become an editor, and an editor is the iceberg — years of polish for something your local editor already does better.
 

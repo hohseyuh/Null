@@ -27,10 +27,20 @@ calls a tool.
 
 ## Tools
 
-All four mirror an HTTP route field-for-field, with one addition:
-`list_notes` and `search_notes` results carry `approx_tokens`
-(`size_bytes / 4`, a rough heuristic) so the model can budget a `get_note`
-call before making it.
+Nine total: four mirror an HTTP route field-for-field (with one addition —
+`list_notes` and `search_notes` results carry `approx_tokens`,
+`size_bytes / 4`, a rough heuristic, so the model can budget a `get_note`
+call before making it); three are new read capabilities with no HTTP
+equivalent (`find_relatives`, `get_links`, `find_path`); two are writes,
+registered only when `NULL_INBOX_PATH` is configured (`create_note`,
+`write_note`).
+
+Every tool result that carries a title runs it through the inbox label
+(see "Inbox" below) — this is not opt-in per call. A model reading any
+`list_notes`/`search_notes`/`get_note`/`get_graph`/`find_relatives`/
+`get_links`/`find_path` result sees, unmissably, which notes are settled
+vault content and which are its own (or another session's) unreviewed
+drafts.
 
 ### `list_notes`
 
@@ -82,6 +92,100 @@ wikilink was written on.
 | `depth` | int | 1–3, default 1 |
 | `direction` | string | `out` \| `in` \| `both` (default) |
 
+### `find_relatives`
+
+No HTTP equivalent. Notes related by **folder and/or shared tags** —
+organizational/topical proximity, independent of the link graph entirely.
+Two notes can be relatives with zero links between them; two linked notes
+need not be relatives.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+| `by` | string | `folder` \| `tags` \| `both` (default) |
+| `limit` | int | 1–100, default 20 |
+
+Each result carries `same_folder` (bool) and `shared_tags` (string[]),
+sorted by shared-tag count then folder match.
+
+### `get_links`
+
+No HTTP equivalent. One note's direct outlinks and backlinks as two
+separate lists, each entry carrying the link's context line — a cheaper
+read than `get_graph(depth=1, direction=both)` when direction is what
+matters and a second hop isn't needed.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+
+### `find_path`
+
+No HTTP equivalent. The shortest chain of wikilinks connecting two
+*specific* notes — "how, if at all, are these related" — as opposed to
+`get_graph`'s "what surrounds this one note." `found: false` with an empty
+`path` means no route within the depth searched; that's a normal result,
+not an error, the same way a zero-hit search isn't one.
+
+| field | type | notes |
+|---|---|---|
+| `from`, `to` | string | required |
+| `depth` | int | max hops, 1–6, default 4 |
+| `direction` | string | `out` \| `in` \| `both` (default) |
+
+### `create_note` / `write_note` — inbox only
+
+Registered only when `NULL_INBOX_PATH` is set. `path` must start with
+`inbox/`; anything else is rejected before touching disk. `create_note`
+fails if a note already exists there (`ErrNoteExists`); `write_note` fails
+if one doesn't (`ErrNoteNotFound`) — deliberately no upsert, so a typo'd
+path can't silently create a stray note or silently clobber an existing
+one.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required; `inbox/...` |
+| `frontmatter` | object | optional |
+| `body` | string | required |
+
+Both call `vault.Index.Refresh` on the inbox index synchronously after a
+successful write, so the very next `get_note`/`list_notes`/`search_notes`
+call sees the change immediately — no race against the watcher's 200ms
+debounce.
+
+## Inbox
+
+A second directory, `NULL_INBOX_PATH`, physically separate from
+`NULL_VAULT_PATH` and never part of the `null-vault` git repo — see
+CLAUDE.md's "Inbox" section for the full rationale. In this package:
+
+- **`internal/vault/write.go`** — `CreateNote`/`WriteNote`, the only code
+  in this repository that opens a file for anything but `O_RDONLY`, and
+  only ever against `NULL_INBOX_PATH`.
+- **`internal/vault/combined.go`** — `Combined` merges a vault `Index` and
+  an inbox `Index` into one `Reader`, prefixing every inbox path with
+  `inbox/` (`mcp.InboxPrefix`) so it can never collide with a real vault
+  path. `Tools.Index` is typed `vault.Reader` precisely so it can hold
+  either a plain `Index` (no inbox configured) or a `Combined`.
+- **Search** is a separate `ripgrep` process per root — `Tools.Search`
+  over the vault, `Tools.InboxSearch` over the inbox (nil when
+  unconfigured) — merged by `SearchNotes` the same way `Combined` merges
+  reads.
+- **Known v0 limitation:** link resolution, backlinks, and `get_graph`/
+  `find_path` traversal do not cross the vault/inbox boundary. A draft's
+  wikilink to a real note (or a real note's link to something that will
+  later live in the inbox — not a real scenario since inbox notes don't
+  exist yet at promotion time, but stated for completeness) stays
+  unresolved until the note is promoted, at which point it's just a
+  normal note in a normal `Index` and resolves normally. `Resolve` (used
+  by would-be renderer integration, not currently wired to `nullapi`) is
+  the one method that does cross the boundary, because a plain
+  target→path lookup is cheap and safe in a way pre-computing every
+  cross-boundary graph edge is not.
+- **Boot-time guard:** a vault with a literal top-level `inbox/` directory
+  fails `nullmcp` startup rather than silently shadowing real notes under
+  the reserved namespace.
+
 ## Error semantics
 
 Business errors — unknown path, unresolved cursor, unknown section, body
@@ -115,9 +219,20 @@ disables it. No auth, keep it on loopback, never run it on the VPS.
   listener is exactly the kind of thing that must not be guessed at. When
   it is built, it must gate on `NULL_TOKEN` with the same constant-time
   compare `internal/api/auth.go` uses, before it is reachable off loopback.
-- **Any tool beyond the four HTTP routes already expose.** No write tools,
-  no embeddings/RAG tool, no note-creation tool — same "deliberately
-  absent" list as the read API, extended to this surface rather than
-  reopened for it.
+- **Any tool that writes to the vault.** `create_note`/`write_note` only
+  ever open files under `NULL_INBOX_PATH`; there is no tool, and there
+  must never be one, that opens anything but `O_RDONLY` under
+  `NULL_VAULT_PATH`.
+- **A promotion tool.** Moving a reviewed inbox note into the vault is a
+  human `git commit`, not a server action — see CLAUDE.md's "Inbox"
+  section. Automating that step is automating the review it exists to
+  force.
+- **Cross-boundary graph edges** (see "Inbox" above) — a real gap, kept
+  open deliberately rather than built around, since the correct fix
+  (merging resolution, not just reads, across two indices) is bigger than
+  this pass and not yet worth it until promoted-vs-draft linking has come
+  up in practice.
+- **Embeddings/RAG, in either the vault or the inbox.** Same reasoning as
+  the read API: not specifiable yet.
 - **A resources/prompts MCP surface.** Only tools are registered. Notes are
   not exposed as MCP resources; nothing here has needed it yet.
