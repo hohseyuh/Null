@@ -3,7 +3,11 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080" # keep it loopback; TLS terminates in the reverse proxy
+      # keep it loopback; TLS terminates in the reverse proxy (or a
+      # tailnet-only bind if that's the whole deployment). Host port is
+      # configurable — 8080 is a common default other services on a
+      # shared box may already hold.
+      - "127.0.0.1:${NULL_HOST_PORT:-8080}:8080"
     environment:
       NULL_VAULT_PATH: /vault
       NULL_TOKEN: ${NULL_TOKEN:?set NULL_TOKEN in .env}
