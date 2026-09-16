@@ -17,13 +17,17 @@
 // promoting a draft into the real vault stays a human, git-mediated act
 // this server never performs. See spec/null-mcp-v0.md.
 //
-// Auth: stdio's trust boundary is the OS process — whoever can spawn this
-// binary already has the access a bearer token would gate over HTTP, so
-// none is required here. If an HTTP/SSE transport is added later (the
-// SDK supports it; see internal/mcp/server.go's NewServer, which is
-// transport-agnostic), it must gate on NULL_TOKEN with the same
-// constant-time compare internal/api/auth.go uses before it is exposed
-// off-loopback — that is not yet wired up.
+// Transport: stdio by default (auth is implicit — the OS process
+// boundary is whoever can spawn this binary). Setting NULL_MCP_HTTP_ADDR
+// switches to the Streamable HTTP transport instead — never both at
+// once: this process's stdin has no real client on it when run as a
+// daemon behind a reverse proxy, and reading from it would just EOF the
+// moment nothing writes to it, exiting the process (this is not
+// hypothetical — it happened during development the first time this
+// binary was smoke-tested backgrounded without a client attached).
+// NULL_TOKEN is required whenever NULL_MCP_HTTP_ADDR is set, checked
+// with the same constant-time compare internal/api/auth.go uses; see
+// internal/mcp/http.go.
 package main
 
 import (
@@ -51,6 +55,8 @@ type config struct {
 	inboxPath     string // empty disables create_note/write_note and inbox visibility
 	maxBodyBytes  int64
 	inspectorAddr string // empty disables the inspector
+	httpAddr      string // empty means stdio transport; set means HTTP-only, see package doc
+	token         string // required iff httpAddr is set
 }
 
 // loadConfig reads configuration from the environment. It assumes it is
@@ -62,6 +68,8 @@ func loadConfig() (config, error) {
 		inboxPath:     os.Getenv("NULL_INBOX_PATH"),
 		maxBodyBytes:  200_000,
 		inspectorAddr: os.Getenv("NULL_MCP_INSPECTOR_ADDR"),
+		httpAddr:      os.Getenv("NULL_MCP_HTTP_ADDR"),
+		token:         os.Getenv("NULL_TOKEN"),
 	}
 	if cfg.vaultPath == "" {
 		return cfg, errors.New("NULL_VAULT_PATH is required")
@@ -87,6 +95,9 @@ func loadConfig() (config, error) {
 			return cfg, fmt.Errorf("NULL_MAX_BODY_BYTES: %q is not a positive integer", v)
 		}
 		cfg.maxBodyBytes = n
+	}
+	if cfg.httpAddr != "" && cfg.token == "" {
+		return cfg, errors.New("NULL_TOKEN is required when NULL_MCP_HTTP_ADDR is set")
 	}
 	return cfg, nil
 }
@@ -184,8 +195,49 @@ func run(log *slog.Logger) error {
 	}
 
 	log.Info("mcp server starting", "vault", cfg.vaultPath, "notes", index.Len())
+
+	if cfg.httpAddr != "" {
+		return runHTTPTransport(ctx, server, cfg.httpAddr, cfg.token, log)
+	}
 	if err := server.Run(ctx, &sdkmcp.StdioTransport{}); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("mcp server: %w", err)
+	}
+	return nil
+}
+
+// runHTTPTransport serves the MCP Streamable HTTP transport at addr
+// until ctx is cancelled, then shuts down gracefully — the HTTP-mode
+// equivalent of server.Run(ctx, &sdkmcp.StdioTransport{}), blocking the
+// same way so run's control flow doesn't need to know which transport
+// is active. addr should be a loopback address; a reverse proxy (see
+// the package doc) is what makes it reachable from anywhere else, and
+// is also what terminates TLS — this process never does.
+func runHTTPTransport(ctx context.Context, server *sdkmcp.Server, addr, token string, log *slog.Logger) error {
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           nullmcp.NewHTTPHandler(server, token, log),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Info("mcp http listening", "addr", addr, "path", nullmcp.HTTPPath)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return fmt.Errorf("mcp http: %w", err)
+	case <-ctx.Done():
+	}
+
+	log.Info("mcp http shutting down")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("mcp http shutdown: %w", err)
 	}
 	return nil
 }

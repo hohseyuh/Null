@@ -5,13 +5,19 @@ directly instead of going through the JSON API. Same read-only lens, same
 non-negotiables, second presentation — not a second implementation.
 
 **Binary:** `cmd/nullmcp`
-**Transport:** stdio (newline-delimited JSON-RPC), launched as a subprocess
-by the client. HTTP/SSE is supported by the underlying SDK and left as a
-documented, unimplemented extension point — see "Deliberately absent"
-below.
-**Auth:** none over stdio. The trust boundary is the OS process: whoever
-can spawn this binary already has the access a bearer token would gate
-over HTTP.
+**Transport:** two modes, mutually exclusive, chosen by whether
+`NULL_MCP_HTTP_ADDR` is set — never both in one process (see "HTTP
+transport" below for why).
+- **stdio** (default): newline-delimited JSON-RPC, launched as a
+  subprocess by the client (Claude Desktop, Claude Code, an SSH command).
+  **Auth:** none. The trust boundary is the OS process — whoever can
+  spawn this binary already has the access a bearer token would gate.
+- **Streamable HTTP** (`NULL_MCP_HTTP_ADDR` set): for a remote client
+  that can't spawn a local subprocess — a browser-based one like
+  Claude.ai's connector settings, most concretely. **Auth:** `NULL_TOKEN`
+  required, checked on every request with the same constant-time compare
+  `internal/api/auth.go` uses. Mandatory, not optional, the moment this
+  mode is on — see below.
 
 ---
 
@@ -237,15 +243,48 @@ around one.
 Opt-in only: set `NULL_MCP_INSPECTOR_ADDR` (e.g. `127.0.0.1:8090`). Empty
 disables it. No auth, keep it on loopback, never run it on the VPS.
 
+## HTTP transport
+
+`internal/mcp/http.go`. Set `NULL_MCP_HTTP_ADDR` to switch `nullmcp` from
+stdio to the MCP Streamable HTTP transport (`mcp.NewStreamableHTTPHandler`),
+mounted at `/mcp`, plus an unauthenticated `GET /healthz` for liveness —
+no vault content or tool schemas in that response, just a 200.
+
+**Why mutually exclusive with stdio, never both in one process:** stdio
+mode's whole trust model is "whoever can spawn this process already has
+access" — that assumption breaks the moment the process is a long-running
+daemon nothing is piping stdin into. A backgrounded process whose stdin
+hits EOF immediately (no client attached) triggers a clean shutdown by
+design — correct behavior for stdio, fatal for a daemon. This happened
+during development the first time the binary was smoke-tested
+backgrounded without a client on stdin: it exited within milliseconds.
+The fix is architectural, not defensive code — HTTP mode never touches
+`&sdkmcp.StdioTransport{}` at all.
+
+**Auth is mandatory the moment this mode is on**, not optional: every
+request to `/mcp` needs `Authorization: Bearer <token>`, checked with the
+same constant-time SHA-256 compare `internal/api/auth.go` uses.
+`loadConfig` refuses to boot with `NULL_MCP_HTTP_ADDR` set and no
+`NULL_TOKEN` — this is enforced at startup, not left as a runtime
+possibility.
+
+**`DisableLocalhostProtection: true`** is set on the SDK's DNS-rebinding
+guard. This handler is designed to sit behind a local reverse proxy
+(Tailscale Funnel, in this repo's own deployment) that connects via
+loopback while forwarding the original public `Host` header — exactly
+what that guard exists to catch under normal circumstances. The bearer
+token is the actual security boundary for this transport; the
+localhost/Host-header check is a different, narrower protection this
+specific topology doesn't need.
+
+**Deployment shape** (`compose.yaml`'s `nullmcp` service, `deploy/`):
+loopback-only (`127.0.0.1:${NULL_MCP_HOST_PORT:-8092}`), TLS terminated
+by whatever reverse-proxies it — Tailscale Funnel in this repo's own
+deployment — never by this process itself. Same non-negotiable as
+everywhere else in this stack: this binary does not do TLS.
+
 ## Deliberately absent from v0
 
-- **HTTP/SSE transport.** `internal/mcp.NewServer` is transport-agnostic —
-  it returns a plain `*mcp.Server` — so wiring `mcp.NewStreamableHTTPHandler`
-  is a small addition later. Not built now because there is no remote
-  consumer yet (Basim doesn't exist), and an unauthenticated network
-  listener is exactly the kind of thing that must not be guessed at. When
-  it is built, it must gate on `NULL_TOKEN` with the same constant-time
-  compare `internal/api/auth.go` uses, before it is reachable off loopback.
 - **Any tool that writes to the vault.** `create_note`/`write_note` only
   ever open files under `NULL_INBOX_PATH`; there is no tool, and there
   must never be one, that opens anything but `O_RDONLY` under

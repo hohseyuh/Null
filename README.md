@@ -119,8 +119,24 @@ binary as a subprocess, e.g. in Claude Desktop's config:
 ```
 
 No `NULL_TOKEN` needed here — stdio's trust boundary is the OS process
-that spawns the binary. (HTTP/SSE transport is left unimplemented; see
-the spec for why and what gates it before it would be added.)
+that spawns the binary.
+
+#### Remote clients (e.g. Claude.ai's connector settings)
+
+For a client that can't spawn a local subprocess, set `NULL_MCP_HTTP_ADDR`
+to switch to the Streamable HTTP transport instead of stdio — never both
+in the same process; see `spec/null-mcp-v0.md`'s "HTTP transport" section
+for why. `NULL_TOKEN` is then required, checked on every request:
+
+```sh
+NULL_VAULT_PATH=/srv/null-vault NULL_MCP_HTTP_ADDR=127.0.0.1:8092 \
+  NULL_TOKEN=$(openssl rand -hex 32) go run ./cmd/nullmcp
+```
+
+Give the remote client `https://your-host/mcp` with `Authorization: Bearer
+<token>` — this process only ever binds loopback; a reverse proxy (this
+repo's own deployment uses Tailscale Funnel) is what makes it reachable
+from anywhere else, and terminates TLS. This binary never does.
 
 To poke at the tools by hand during development, set
 `NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090` and open that address — a
@@ -147,6 +163,16 @@ docker compose up -d --build
 # verify the mount really is read-only
 docker compose exec nullapi sh -c 'mount | grep vault && touch /vault/x; echo exit=$?'
 # expect: ...(ro,...) and "Read-only file system", exit=1
+```
+
+`compose.yaml` also has an `nullmcp` service (same image, different
+entrypoint) for the HTTP transport — add to `.env` and it starts
+alongside `nullapi`:
+
+```sh
+echo "NULL_MCP_TOKEN=$(openssl rand -hex 32)" >> .env   # separate from NULL_TOKEN, deliberately
+echo "INBOX_PATH=/srv/null-inbox" >> .env
+docker compose up -d --build
 ```
 
 Bare metal: `deploy/nullapi.service` (systemd, `DynamicUser`,

@@ -17,3 +17,30 @@ services:
       # read-only mount is deliberate — verify with: mount | grep vault
       - ${VAULT_PATH:?set VAULT_PATH in .env}:/vault:ro
     read_only: true
+
+  # MCP over Streamable HTTP, for a remote client (e.g. Claude.ai's
+  # connector settings) that can't spawn nullmcp locally over stdio.
+  # Optional: comment this whole service out, or just never set
+  # NULL_MCP_TOKEN in .env, if you only ever use nullmcp over stdio/SSH.
+  nullmcp:
+    build: .
+    entrypoint: ["nullmcp"]
+    restart: unless-stopped
+    ports:
+      # loopback only, same reasoning as nullapi above — a reverse proxy
+      # (Tailscale Funnel, in this repo's own deployment) is what makes
+      # it reachable from anywhere else, and terminates TLS.
+      - "127.0.0.1:${NULL_MCP_HOST_PORT:-8092}:8092"
+    environment:
+      NULL_VAULT_PATH: /vault
+      NULL_INBOX_PATH: /inbox
+      NULL_MCP_HTTP_ADDR: ":8092"
+      NULL_TOKEN: ${NULL_MCP_TOKEN:?set NULL_MCP_TOKEN in .env}
+      # Deliberately its own token, distinct from nullapi's NULL_TOKEN —
+      # two services, two independently revocable credentials.
+    volumes:
+      - ${VAULT_PATH:?set VAULT_PATH in .env}:/vault:ro
+      # NOT :ro — this is the one write-capable mount anywhere in this
+      # deployment, and it is not the vault. See CLAUDE.md's Inbox section.
+      - ${INBOX_PATH:?set INBOX_PATH in .env}:/inbox
+    read_only: true
