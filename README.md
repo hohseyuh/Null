@@ -1,8 +1,9 @@
 # null-service
 
-Read-only HTTP lens over a plain-markdown vault. JSON API plus a
-server-rendered HTML reader, one process, one in-memory index. The vault
-stays canonical on disk; delete this server and nothing is lost.
+Read-only lens over a plain-markdown vault, served three ways from the
+same in-memory index: a JSON API, a server-rendered HTML reader, and an
+MCP server for a language model to call directly. The vault stays
+canonical on disk; delete this server and nothing is lost.
 
 ## Requirements
 
@@ -60,6 +61,41 @@ Same token, held by a cookie: open `/login?token=$NULL_TOKEN` once, then
 - `/s?q=` — search with highlighted snippets
 
 No editor, no JS, one stylesheet.
+
+### MCP server
+
+For a language model to call the vault directly instead of going through
+HTTP — `list_notes`, `get_note`, `search_notes`, `get_graph`, the same
+four operations with the same guarantees (list/search never return
+bodies; every path is safety-checked; nothing writes). Full contract in
+[`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
+
+```sh
+NULL_VAULT_PATH=/srv/null-vault go run ./cmd/nullmcp
+```
+
+Speaks stdio — point a client (Claude Desktop, Claude Code, etc.) at the
+binary as a subprocess, e.g. in Claude Desktop's config:
+
+```json
+{
+  "mcpServers": {
+    "null": {
+      "command": "/path/to/nullmcp",
+      "env": { "NULL_VAULT_PATH": "/srv/null-vault" }
+    }
+  }
+}
+```
+
+No `NULL_TOKEN` needed here — stdio's trust boundary is the OS process
+that spawns the binary. (HTTP/SSE transport is left unimplemented; see
+the spec for why and what gates it before it would be added.)
+
+To poke at the tools by hand during development, set
+`NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090` and open that address — a
+server-rendered, zero-JS page that calls tools over a real MCP session.
+Dev-only, no auth, keep it on loopback.
 
 ## Tests
 

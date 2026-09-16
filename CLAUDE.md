@@ -43,6 +43,7 @@ These are architectural commitments, not preferences. If a change would violate 
 - `goldmark` for markdown AST (heading extraction) **and HTML rendering**, `goccy/go-yaml` for frontmatter.
 - **Renderer: Go `html/template`, server-rendered, no JS framework.** Not a separate app. No React, no Next.js, no build step, no client-side routing. One stylesheet, hand-written.
 - Single static bearer token from env. No OAuth, no users, no roles — one human uses this.
+- `modelcontextprotocol/go-sdk` for the MCP layer (`cmd/nullmcp`, `internal/mcp`) — the official Go SDK, stdio transport only for now. Same in-memory index as the API and renderer; no second parse.
 
 Chosen because Go is the current backend track and this is a small concurrent I/O service, which is exactly its shape.
 
@@ -50,6 +51,7 @@ Chosen because Go is the current backend track and this is a small concurrent I/
 
 ```
 cmd/nullapi/main.go       entrypoint, config, graceful shutdown
+cmd/nullmcp/main.go       MCP entrypoint, same vault/search wiring, stdio transport
 internal/vault/           parse, index, watch — the core
   note.go                 Note struct, frontmatter + heading extraction
   index.go                in-memory index, path→Note, link graph
@@ -62,6 +64,11 @@ internal/search/          ripgrep wrapper, result parsing
 internal/render/          html/template handlers, goldmark→HTML, wikilink rewriting
   templates/              layout.html, list.html, note.html, search.html
   static/                 one stylesheet, one font stack. no bundler.
+internal/mcp/             MCP tools over the same in-memory index — a second
+                           presentation of the read API, not a second implementation
+  tools.go                Tools + typed In/Out structs; no MCP SDK import, testable bare
+  server.go                wires Tools to SDK tool handlers + descriptions
+  inspector.go             dev-only HTTP page for manual tool calls, opt-in via env
 spec/                     the specs below — read before implementing
 ```
 
