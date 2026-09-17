@@ -30,6 +30,14 @@ var ErrNoteNotFound = errors.New("note not found")
 // Callers are responsible for running rel through SafeRequestPath(root,
 // rel) before calling any function here; none of them re-derive path
 // safety themselves, to keep that one gate the single source of truth.
+//
+// One refinement on "exactly one commit": WriteNote amends its own
+// immediately-preceding commit when that commit was itself an unbroken
+// write_note update to the same path (see commitPathAmendable) — editing
+// one note ten times in a row inside one session produces one commit,
+// not ten, as long as nothing else is committed in between. CreateNote
+// and DeleteNote never amend; every create and every delete is always
+// its own fresh commit, no exceptions.
 
 // gitMu serializes every stage-then-commit sequence in this process, so
 // two concurrent tool calls can never interleave their git operations
@@ -104,6 +112,61 @@ func commitPath(root, rel, message string) error {
 		return fmt.Errorf("git commit: %w: %s", err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// commitPathAmendable is commitPath's WriteNote-only sibling: if HEAD is
+// already a write_note "Update <rel>" commit touching nothing but rel,
+// it amends that commit instead of stacking a new one on top. This is
+// the fix for "edit the same note ten times in a row" producing ten
+// commits — repeated revisions inside one unbroken editing session
+// collapse into the single commit that represents where the note ended
+// up, with the latest reason (an older one is superseded, not kept).
+//
+// CreateNote and DeleteNote never call this — see canAmendWriteNoteHEAD
+// for exactly why amending is scoped to write_note-on-write_note only.
+// The moment anything else is committed in between (a different note, a
+// create, a delete, a human's own commit), the chain breaks and the next
+// write_note starts a fresh commit — so amending only ever collapses
+// genuinely contiguous edits, never reaches back across other changes.
+func commitPathAmendable(root, rel, message string) error {
+	gitMu.Lock()
+	defer gitMu.Unlock()
+	if out, err := runGit(root, "add", "--", rel); err != nil {
+		return fmt.Errorf("git add: %w: %s", err, strings.TrimSpace(out))
+	}
+
+	args := []string{"commit", "-m", message, "--", rel}
+	if canAmendWriteNoteHEAD(root, rel) {
+		args = []string{"commit", "--amend", "-m", message, "--", rel}
+	}
+	if out, err := runGit(root, args...); err != nil {
+		return fmt.Errorf("git commit: %w: %s", err, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// canAmendWriteNoteHEAD reports whether HEAD is safe to amend in place
+// for a new write_note commit on rel: HEAD's own message must be exactly
+// a prior write_note "Update <rel>" commit (checked by header line and
+// Source trailer, not just a loose substring match — a coincidental
+// prefix match on a differently-named path, e.g. "foo.md" vs
+// "foo.md.bak", must not pass), and HEAD must touch nothing but rel.
+// Caller must hold gitMu.
+func canAmendWriteNoteHEAD(root, rel string) bool {
+	msg, err := runGit(root, "log", "-1", "--pretty=%B")
+	if err != nil {
+		return false
+	}
+	header, _, _ := strings.Cut(msg, "\n")
+	if header != "Update "+rel || !strings.Contains(msg, "\nSource: nullmcp write_note") {
+		return false
+	}
+	out, err := runGit(root, "show", "--name-only", "--pretty=format:", "HEAD")
+	if err != nil {
+		return false
+	}
+	changed := strings.Fields(strings.TrimSpace(out))
+	return len(changed) == 1 && changed[0] == rel
 }
 
 // commitDelete stages rel's removal (git rm both deletes the file and
@@ -195,9 +258,12 @@ func CreateNote(root, rel string, frontmatter map[string]any, body, reason strin
 
 // WriteNote overwrites an existing note at root/rel wholesale — the full
 // new frontmatter and body replace whatever was there — and commits it
-// as "Update <rel>". Fails with ErrNoteNotFound if nothing exists yet at
-// that path — use CreateNote for a new note. rel must already have
-// passed SafeRequestPath(root, rel).
+// as "Update <rel>", amending straight into the prior commit instead of
+// stacking a new one if that prior commit was itself an unbroken
+// write_note update to this same path (see commitPathAmendable). Fails
+// with ErrNoteNotFound if nothing exists yet at that path — use
+// CreateNote for a new note. rel must already have passed
+// SafeRequestPath(root, rel).
 func WriteNote(root, rel string, frontmatter map[string]any, body, reason string) error {
 	abs := filepath.Join(root, filepath.FromSlash(rel))
 	if st, err := os.Lstat(abs); err != nil {
@@ -225,7 +291,7 @@ func WriteNote(root, rel string, frontmatter map[string]any, body, reason string
 		return fmt.Errorf("close %s: %w", rel, err)
 	}
 
-	if err := commitPath(root, rel, commitMessage("Update", rel, reason, "write_note")); err != nil {
+	if err := commitPathAmendable(root, rel, commitMessage("Update", rel, reason, "write_note")); err != nil {
 		return fmt.Errorf("commit %s: %w", rel, err)
 	}
 	return nil

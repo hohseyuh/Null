@@ -2,6 +2,7 @@ package vault
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os/exec"
 	"strings"
@@ -62,6 +63,17 @@ func lastCommitMessage(t *testing.T, root string) string {
 	out, err := exec.Command("git", "-C", root, "log", "-1", "--pretty=%B").Output()
 	if err != nil {
 		t.Fatalf("log: %v", err)
+	}
+	return string(out)
+}
+
+// gitOutput runs a git command in root and returns its stdout, failing
+// the test on error.
+func gitOutput(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", root}, args...)...).Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
 	}
 	return string(out)
 }
@@ -152,6 +164,129 @@ func TestWriteNoteCommitsExactlyOneFile(t *testing.T) {
 	n, _ := ix.Get("draft.md")
 	if n.Frontmatter["status"] != "revised" || n.Body != "\n# draft\n\nsecond version\n" {
 		t.Fatalf("after write: frontmatter=%v body=%q", n.Frontmatter, n.Body)
+	}
+}
+
+func TestConsecutiveWriteNoteCallsCollapseIntoOneCommit(t *testing.T) {
+	root := gitTempRepo(t)
+	if err := CreateNote(root, "draft.md", nil, "# draft\n\nv1\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	before := commitCount(t, root)
+
+	// ten edits in a row to the same note
+	for i := 2; i <= 10; i++ {
+		body := fmt.Sprintf("# draft\n\nv%d\n", i)
+		if err := WriteNote(root, "draft.md", nil, body, fmt.Sprintf("revision %d", i)); err != nil {
+			t.Fatalf("WriteNote v%d: %v", i, err)
+		}
+	}
+
+	// the first WriteNote (v1 -> v2) starts a fresh "Update" commit;
+	// every one after that (v2->v3 ... v9->v10) amends it in place — so
+	// nine WriteNote calls produce exactly one new commit, not nine.
+	if got := commitCount(t, root); got != before+1 {
+		t.Fatalf("commit count = %d, want %d (nine edits should collapse into one commit)", got, before+1)
+	}
+	if files := lastCommitFiles(t, root); len(files) != 1 || files[0] != "draft.md" {
+		t.Fatalf("commit touched %v, want exactly [draft.md]", files)
+	}
+
+	// the final state is v10, and only the LATEST reason survives —
+	// stale intermediate reasons aren't kept piling up in the message
+	msg := lastCommitMessage(t, root)
+	if !strings.Contains(msg, "revision 10") {
+		t.Fatalf("commit message should carry the latest reason: %q", msg)
+	}
+	if strings.Contains(msg, "revision 9") || strings.Contains(msg, "revision 2") {
+		t.Fatalf("commit message should not accumulate stale reasons: %q", msg)
+	}
+
+	ix := NewIndex(root, slog.New(slog.DiscardHandler))
+	if err := ix.Build(); err != nil {
+		t.Fatal(err)
+	}
+	n, _ := ix.Get("draft.md")
+	if n.Body != "# draft\n\nv10\n" { // no frontmatter this time, so no fence, so no leading blank line
+		t.Fatalf("final body = %q, want v10", n.Body)
+	}
+
+	// the amended commit's PARENT is still the original "Add" commit —
+	// amending replaced the tip, it didn't insert extra history beneath it
+	parentSubject := strings.TrimSpace(gitOutput(t, root, "log", "-1", "--skip=1", "--pretty=%s"))
+	if parentSubject != "Add draft.md" {
+		t.Fatalf("parent of the collapsed commit = %q, want %q", parentSubject, "Add draft.md")
+	}
+}
+
+func TestWriteNoteDoesNotAmendAcrossADifferentCommit(t *testing.T) {
+	root := gitTempRepo(t)
+	if err := CreateNote(root, "a.md", nil, "# a\n\nv1\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateNote(root, "b.md", nil, "# b\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	before := commitCount(t, root)
+
+	// edit a.md, then something else happens to b.md, then edit a.md
+	// again — the chain is broken, so this must NOT amend across b.md's
+	// commit and silently drop it from history
+	if err := WriteNote(root, "a.md", nil, "# a\n\nv2\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteNote(root, "b.md", nil, "# b\n\nedited\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteNote(root, "a.md", nil, "# a\n\nv3\n", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := commitCount(t, root); got != before+3 {
+		t.Fatalf("commit count = %d, want %d (three genuinely separate edits)", got, before+3)
+	}
+	// b.md's commit must still be there, untouched, in the middle
+	subjects := []string{
+		strings.TrimSpace(gitOutput(t, root, "log", "-1", "--skip=2", "--pretty=%s")),
+		strings.TrimSpace(gitOutput(t, root, "log", "-1", "--skip=1", "--pretty=%s")),
+		strings.TrimSpace(gitOutput(t, root, "log", "-1", "--skip=0", "--pretty=%s")),
+	}
+	want := []string{"Update a.md", "Update b.md", "Update a.md"}
+	if subjects[0] != want[0] || subjects[1] != want[1] || subjects[2] != want[2] {
+		t.Fatalf("commit sequence = %v, want %v", subjects, want)
+	}
+}
+
+func TestCreateAndDeleteNeverAmend(t *testing.T) {
+	root := gitTempRepo(t)
+
+	// two creates in a row (different paths) must never collapse —
+	// amending is write_note-only, by design
+	if err := CreateNote(root, "one.md", nil, "# one\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	beforeSecondCreate := commitCount(t, root)
+	if err := CreateNote(root, "two.md", nil, "# two\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := commitCount(t, root); got != beforeSecondCreate+1 {
+		t.Fatalf("second CreateNote must be its own commit: count = %d, want %d", got, beforeSecondCreate+1)
+	}
+
+	// write then delete the same path: delete must be its own commit,
+	// never amended into the prior update
+	if err := WriteNote(root, "one.md", nil, "# one\n\nrevised\n", ""); err != nil {
+		t.Fatal(err)
+	}
+	beforeDelete := commitCount(t, root)
+	if err := DeleteNote(root, "one.md", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := commitCount(t, root); got != beforeDelete+1 {
+		t.Fatalf("DeleteNote must be its own commit: count = %d, want %d", got, beforeDelete+1)
+	}
+	if msg := lastCommitMessage(t, root); !strings.HasPrefix(msg, "Delete one.md") {
+		t.Fatalf("commit message = %q", msg)
 	}
 }
 
