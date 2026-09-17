@@ -92,6 +92,32 @@ func readNoteFile(abs string) ([]byte, time.Time, error) {
 	return b, st.ModTime(), nil
 }
 
+// enforceAsilLock chmods abs read-only (0444) whenever n's tier is asil
+// and it isn't already — defense in depth for "asil write-locked at the
+// filesystem" (spec/tiers.md): even if every application-layer check on
+// the write path were somehow bypassed, the OS itself refuses the open.
+// Runs on every index build and every reparse, so it self-heals however
+// a note arrived at asil — a human editing frontmatter directly via git,
+// not only Al-Mina's own promotion. One-way by design: asil has no
+// demotion path in the spec, so this never chmods a note back writable.
+// Best-effort and non-fatal — indexing must never fail from a permission
+// fix attempt.
+func enforceAsilLock(abs string, n *Note, log *slog.Logger) {
+	if n.Tier != TierAsil {
+		return
+	}
+	st, err := os.Stat(abs)
+	if err != nil {
+		return
+	}
+	if st.Mode().Perm() == 0o444 {
+		return
+	}
+	if err := os.Chmod(abs, 0o444); err != nil && log != nil {
+		log.Warn("failed to write-lock asil note", "path", n.Path, "err", err)
+	}
+}
+
 // Build walks the vault, parses every visible .md file, and publishes the
 // index. It assumes the root exists and logs boot timing; a single
 // unreadable file is logged and skipped, never fatal.
@@ -125,7 +151,9 @@ func (ix *Index) Build() error {
 			ix.log.Warn("skipping unreadable note", "path", rel, "err", rerr)
 			return nil
 		}
-		parsed[rel] = Parse(rel, raw, mtime, ix.log)
+		n := Parse(rel, raw, mtime, ix.log)
+		parsed[rel] = n
+		enforceAsilLock(abs, n, ix.log)
 		return nil
 	})
 	if err != nil {
@@ -220,7 +248,9 @@ func (ix *Index) applyBatch(rels []string) {
 			continue
 		}
 		ix.reparses.Add(1)
-		batch = append(batch, parsedNote{rel, Parse(rel, raw, mtime, ix.log)})
+		n := Parse(rel, raw, mtime, ix.log)
+		enforceAsilLock(abs, n, ix.log)
+		batch = append(batch, parsedNote{rel, n})
 	}
 
 	ix.mu.Lock()

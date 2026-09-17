@@ -13,6 +13,9 @@ services:
       NULL_TOKEN: ${NULL_TOKEN:?set NULL_TOKEN in .env}
       NULL_ADDR: ":8080"
       # NULL_MAX_BODY_BYTES: "200000"
+      # How old a dakhil note must be, with no outstanding proposal,
+      # before GET /mina surfaces it as a staleness sweep. Default 14.
+      # NULL_MINA_STALE_DAYS: "14"
     volumes:
       # read-only mount is deliberate — verify with: mount | grep vault
       - ${VAULT_PATH:?set VAULT_PATH in .env}:/vault:ro

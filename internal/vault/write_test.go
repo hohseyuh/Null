@@ -139,12 +139,12 @@ func TestWriteNoteCommitsExactlyOneFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := WriteNote(root, "nope.md", nil, "x", ""); !errors.Is(err, ErrNoteNotFound) {
+	if _, err := WriteNote(root, "nope.md", nil, "x", ""); !errors.Is(err, ErrNoteNotFound) {
 		t.Fatalf("WriteNote on missing: err = %v, want ErrNoteNotFound", err)
 	}
 
 	before := commitCount(t, root)
-	if err := WriteNote(root, "draft.md", map[string]any{"status": "revised"}, "# draft\n\nsecond version\n", ""); err != nil {
+	if _, err := WriteNote(root, "draft.md", map[string]any{"status": "revised"}, "# draft\n\nsecond version\n", ""); err != nil {
 		t.Fatalf("WriteNote: %v", err)
 	}
 	if got := commitCount(t, root); got != before+1 {
@@ -177,7 +177,7 @@ func TestConsecutiveWriteNoteCallsCollapseIntoOneCommit(t *testing.T) {
 	// ten edits in a row to the same note
 	for i := 2; i <= 10; i++ {
 		body := fmt.Sprintf("# draft\n\nv%d\n", i)
-		if err := WriteNote(root, "draft.md", nil, body, fmt.Sprintf("revision %d", i)); err != nil {
+		if _, err := WriteNote(root, "draft.md", nil, body, fmt.Sprintf("revision %d", i)); err != nil {
 			t.Fatalf("WriteNote v%d: %v", i, err)
 		}
 	}
@@ -232,13 +232,13 @@ func TestWriteNoteDoesNotAmendAcrossADifferentCommit(t *testing.T) {
 	// edit a.md, then something else happens to b.md, then edit a.md
 	// again — the chain is broken, so this must NOT amend across b.md's
 	// commit and silently drop it from history
-	if err := WriteNote(root, "a.md", nil, "# a\n\nv2\n", ""); err != nil {
+	if _, err := WriteNote(root, "a.md", nil, "# a\n\nv2\n", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteNote(root, "b.md", nil, "# b\n\nedited\n", ""); err != nil {
+	if _, err := WriteNote(root, "b.md", nil, "# b\n\nedited\n", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteNote(root, "a.md", nil, "# a\n\nv3\n", ""); err != nil {
+	if _, err := WriteNote(root, "a.md", nil, "# a\n\nv3\n", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -275,7 +275,7 @@ func TestCreateAndDeleteNeverAmend(t *testing.T) {
 
 	// write then delete the same path: delete must be its own commit,
 	// never amended into the prior update
-	if err := WriteNote(root, "one.md", nil, "# one\n\nrevised\n", ""); err != nil {
+	if _, err := WriteNote(root, "one.md", nil, "# one\n\nrevised\n", ""); err != nil {
 		t.Fatal(err)
 	}
 	beforeDelete := commitCount(t, root)

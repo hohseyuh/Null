@@ -4,6 +4,8 @@ Ordered milestones. Each ends at a state you can run and verify. Do not start on
 
 Read `spec/null-read-api-v0.md` before M1 and re-read the relevant section at the start of each milestone.
 
+**Status: shipped.** All of M0–M7 below are built; this file is historical from here on, not a live plan. Everything built since (the write path, OAuth, the curation-tier system) is tracked in `spec/null-mcp-v0.md` and `spec/tiers.md` instead. Note: `spec/tiers.md`'s own "Build order" section reuses the labels `M6a`/`M6b`/`M6c`/`M7` for a later, unrelated milestone sequence (the tier permission matrix and the renderer's graph view) — those are not a continuation of this file's M6/M7 below, just a label collision worth knowing about if you're reading both.
+
 ---
 
 ## M0 — Skeleton

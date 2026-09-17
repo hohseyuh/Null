@@ -46,6 +46,7 @@ func (s *Server) Router() http.Handler {
 		v.Get("/v1/notes/*", s.handleGetNote)
 		v.Get("/v1/search", s.handleSearch)
 		v.Get("/v1/graph", s.handleGraph)
+		v.Get("/mina", s.handleMina)
 	})
 
 	if s.Renderer != nil {

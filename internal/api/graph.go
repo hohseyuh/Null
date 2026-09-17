@@ -8,12 +8,13 @@ import (
 	"null-service/internal/vault"
 )
 
-// graphEdge is the wire shape of one edge: from, to, and the line the
-// link was written on.
+// graphEdge is the wire shape of one edge: from, to, the line the link
+// was written on, and the lower of its two endpoints' tiers.
 type graphEdge struct {
 	From    string `json:"from"`
 	To      string `json:"to"`
 	Context string `json:"context"`
+	Tier    string `json:"tier"`
 }
 
 // handleGraph serves GET /v1/graph: the BFS neighborhood of one note.
@@ -56,7 +57,7 @@ func (s *Server) handleGraph(w http.ResponseWriter, r *http.Request) {
 	g := s.Index.Graph(rel, depth, direction)
 	edges := make([]graphEdge, 0, len(g.Edges))
 	for _, e := range g.Edges {
-		edges = append(edges, graphEdge{From: e.From, To: e.To, Context: e.Context})
+		edges = append(edges, graphEdge{From: e.From, To: e.To, Context: e.Context, Tier: string(e.Tier)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"root":  g.Root,

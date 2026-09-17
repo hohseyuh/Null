@@ -1,8 +1,9 @@
 // Command nullmcp exposes the vault as Model Context Protocol tools —
 // list_notes, get_note, search_notes, get_graph, find_relatives,
-// get_links, find_path, create_note, write_note, delete_note, and
-// push_vault — over stdio, for a local LLM client (Claude Desktop,
-// Claude Code, a future Basim process) to launch as a subprocess.
+// get_links, find_path, create_note, write_note, delete_note, tier_get,
+// tier_set, and tier_propose — over stdio, for a local LLM client
+// (Claude Desktop, Claude Code, a future Basim process) to launch as a
+// subprocess.
 //
 // Same vault, same vault/search packages, same path-safety rules as
 // nullapi: this is a second presentation of the read API, and now also
@@ -10,8 +11,13 @@
 // spec/null-mcp-v0.md. Writes go straight to NULL_VAULT_PATH; the vault
 // must be a git repository (checked at boot, see vault.EnsureGitRepo),
 // because every create_note, write_note, and delete_note becomes its own
-// isolated commit. push_vault is the one tool that ever sends anything
-// to the configured remote — nothing pushes automatically.
+// isolated commit. There is no push or commit tool exposed to the model
+// anywhere in this binary — see spec/tiers.md's "One door" — the server
+// commits on write, and a human pushes with their own `git push`.
+//
+// Every note carries a tier (spec/tiers.md): dakhil, amil, thabit, or
+// asil, server-owned. tier_set can only lower a tier (R1); only a human,
+// via Al-Mina, ever raises one.
 //
 // Transport: stdio by default (auth is implicit — the OS process
 // boundary is whoever can spawn this binary). Setting NULL_MCP_HTTP_ADDR

@@ -46,12 +46,17 @@ type Note struct {
 	Title       string
 	Frontmatter map[string]any
 	Tags        []string
-	Body        string
-	BodyLine    int // 1-based file line the body starts on
-	Headings    []Heading
-	Outlinks    []Link
-	UpdatedAt   time.Time
-	SizeBytes   int64
+	// Tier is the note's curation level, parsed from frontmatter's tier
+	// field and defaulted to TierDakhil when absent or unrecognized. See
+	// spec/tiers.md; enforcement lives in write.go, not here — Parse only
+	// reads.
+	Tier      Tier
+	Body      string
+	BodyLine  int // 1-based file line the body starts on
+	Headings  []Heading
+	Outlinks  []Link
+	UpdatedAt time.Time
+	SizeBytes int64
 }
 
 var md = goldmark.New()
@@ -78,6 +83,7 @@ func Parse(relPath string, raw []byte, mtime time.Time, log *slog.Logger) *Note 
 		Title:       strings.TrimSuffix(path.Base(relPath), ".md"),
 		Frontmatter: front,
 		Tags:        tagsFrom(front),
+		Tier:        ParseTier(front["tier"]),
 		Body:        string(body),
 		BodyLine:    bodyLine,
 		Headings:    extractHeadings(body, bodyLine-1),

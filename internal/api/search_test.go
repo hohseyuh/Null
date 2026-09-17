@@ -12,6 +12,7 @@ type searchResponse struct {
 	Results []struct {
 		Path    string  `json:"path"`
 		Title   string  `json:"title"`
+		Tier    string  `json:"tier"`
 		Score   float64 `json:"score"`
 		Matches []struct {
 			Line    int    `json:"line"`
@@ -53,6 +54,32 @@ func TestSearchBody(t *testing.T) {
 	}
 }
 
+// TestSearchResultsCarryTier is spec/tiers.md's explicit requirement:
+// tier appears in every /search response entry.
+func TestSearchResultsCarryTier(t *testing.T) {
+	_, _, resp := doSearch(t, "q="+url.QueryEscape("does not change"))
+	if len(resp.Results) == 0 {
+		t.Fatal("expected at least one result to check")
+	}
+	for _, r := range resp.Results {
+		if r.Tier == "" {
+			t.Fatalf("result %s has no tier", r.Path)
+		}
+	}
+}
+
+func TestSearchTierFilter(t *testing.T) {
+	code, _, resp := doSearch(t, "q="+url.QueryEscape("does not change")+"&tier=asil")
+	if code != http.StatusOK || len(resp.Results) != 0 {
+		t.Fatalf("tier=asil should exclude every fixture note: code=%d results=%+v", code, resp.Results)
+	}
+
+	code, _, _ = doSearch(t, "q=x&tier=not-a-real-tier")
+	if code != http.StatusBadRequest {
+		t.Fatalf("unknown tier: status = %d, want 400", code)
+	}
+}
+
 func TestSearchDiacriticFolding(t *testing.T) {
 	code, raw, resp := doSearch(t, "q=sirr")
 	if code != http.StatusOK {
@@ -69,8 +96,10 @@ func TestSearchTitleAndFilters(t *testing.T) {
 	if code != http.StatusOK || len(resp.Results) != 1 || resp.Results[0].Path != "engineering/basim/soul.md" {
 		t.Fatalf("title search: code=%d results=%+v", code, resp.Results)
 	}
-	if resp.Results[0].Score != 1.0 {
-		t.Fatalf("title match score = %v, want 1.0", resp.Results[0].Score)
+	// soul.md carries no tier field, so it's dakhil by default — a title
+	// match scores 1.0 before the tier weight (0.4 for dakhil) is applied.
+	if resp.Results[0].Score != 0.4 {
+		t.Fatalf("title match score = %v, want 0.4", resp.Results[0].Score)
 	}
 
 	// folder filter excludes the hit

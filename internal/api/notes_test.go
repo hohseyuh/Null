@@ -52,6 +52,60 @@ func TestListNotesMetadataOnly(t *testing.T) {
 	t.Fatal("soul.md not listed")
 }
 
+// TestNotesCarryTier is spec/tiers.md's explicit requirement: tier
+// appears in every /notes response entry.
+func TestNotesCarryTier(t *testing.T) {
+	rec := get(t, "/v1/notes")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Notes []struct {
+			Path string `json:"path"`
+			Tier string `json:"tier"`
+		} `json:"notes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range resp.Notes {
+		if n.Tier == "" {
+			t.Fatalf("note %s has no tier in the response", n.Path)
+		}
+	}
+}
+
+func TestListNotesTierFilter(t *testing.T) {
+	// the fixture vault carries no tier frontmatter anywhere, so every
+	// note defaults to dakhil
+	rec := get(t, "/v1/notes?tier=dakhil")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Notes []struct{ Path string } `json:"notes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Notes) != 6 {
+		t.Fatalf("tier=dakhil returned %d notes, want 6 (the whole fixture vault)", len(resp.Notes))
+	}
+
+	rec = get(t, "/v1/notes?tier=asil")
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Notes) != 0 {
+		t.Fatalf("tier=asil returned %d notes, want 0", len(resp.Notes))
+	}
+
+	rec = get(t, "/v1/notes?tier=not-a-real-tier")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown tier: status = %d, want 400", rec.Code)
+	}
+}
+
 func TestListNotesFilters(t *testing.T) {
 	tests := []struct {
 		name  string

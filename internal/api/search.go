@@ -7,12 +7,16 @@ import (
 	"strings"
 
 	"null-service/internal/search"
+	"null-service/internal/vault"
 )
 
 // searchResult is one hit in a /search response: snippets, never bodies.
+// Score is weighted by tier (spec/tiers.md) — settled knowledge outranks
+// raw capture without excluding it from results.
 type searchResult struct {
 	Path    string         `json:"path"`
 	Title   string         `json:"title"`
+	Tier    string         `json:"tier"`
 	Score   float64        `json:"score"`
 	Matches []search.Match `json:"matches"`
 }
@@ -47,6 +51,15 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		limit = min(n, 50)
 	}
 
+	var tier vault.Tier
+	if v := r.URL.Query().Get("tier"); v != "" {
+		tier = vault.Tier(v)
+		if !tier.Valid() {
+			writeError(w, http.StatusBadRequest, "bad_request", "tier must be one of dakhil, amil, thabit, asil")
+			return
+		}
+	}
+
 	folder := strings.TrimSuffix(r.URL.Query().Get("folder"), "/")
 	tags := r.URL.Query()["tag"]
 	visible := func(path string) bool {
@@ -55,6 +68,9 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 		if folder != "" && !strings.HasPrefix(path, folder+"/") {
+			return false
+		}
+		if tier != "" && n.Tier != tier {
 			return false
 		}
 		return hasAllTags(n.Tags, tags)
@@ -83,7 +99,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			hits[res.Path] = &searchResult{
 				Path:    res.Path,
 				Title:   n.Title,
-				Score:   float64(len(res.Matches)) / float64(maxCount),
+				Tier:    string(n.Tier),
+				Score:   (float64(len(res.Matches)) / float64(maxCount)) * n.Tier.SearchWeight(),
 				Matches: res.Matches,
 			}
 		}
@@ -95,14 +112,16 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			if !strings.Contains(search.Fold(n.Title), folded) || !visible(n.Path) {
 				continue
 			}
+			score := 1.0 * n.Tier.SearchWeight()
 			if h, ok := hits[n.Path]; ok {
-				h.Score = 1.0 // matched both title and body
+				h.Score = score // matched both title and body
 				continue
 			}
 			hits[n.Path] = &searchResult{
 				Path:    n.Path,
 				Title:   n.Title,
-				Score:   1.0,
+				Tier:    string(n.Tier),
+				Score:   score,
 				Matches: []search.Match{},
 			}
 		}

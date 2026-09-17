@@ -1,9 +1,11 @@
 # null-service
 
-Read-only lens over a plain-markdown vault, served three ways from the
-same in-memory index: a JSON API, a server-rendered HTML reader, and an
-MCP server for a language model to call directly. The vault stays
-canonical on disk; delete this server and nothing is lost.
+A plain-markdown vault, served three ways from the same in-memory index:
+a JSON API, a server-rendered HTML reader, and an MCP server that also
+writes to the vault directly. The vault stays canonical on disk; delete
+this server and nothing is lost. Every note carries a curation tier —
+`dakhil`/`amil`/`thabit`/`asil` — that the model can lower or propose but
+never raise; see [`spec/tiers.md`](spec/tiers.md).
 
 ## Requirements
 
@@ -33,9 +35,11 @@ All `/v1` routes except `/v1/health` require `Authorization: Bearer $NULL_TOKEN`
 # health — the only open route
 curl http://localhost:8080/v1/health
 
-# list notes: metadata only, never bodies
+# list notes: metadata only, never bodies; every entry carries its tier
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/notes?folder=engineering/&tag=spec&sort=updated&limit=50'
+curl -H "Authorization: Bearer $NULL_TOKEN" \
+  'http://localhost:8080/v1/notes?tier=dakhil&updated_before=2026-01-01T00:00:00Z'
 
 # one note — the only route that returns a body; slice big notes by heading
 curl -H "Authorization: Bearer $NULL_TOKEN" \
@@ -47,9 +51,15 @@ curl -H "Authorization: Bearer $NULL_TOKEN" \
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/search?q=sirr&in=body&limit=20'
 
-# graph: BFS neighborhood; every edge carries the line its wikilink was written on
+# graph: BFS neighborhood; every edge carries the line its wikilink was
+# written on and the lower of its two endpoints' tiers
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/graph?path=engineering/basim/soul.md&depth=2&direction=both'
+
+# Al-Mina's proposal queue: notes with an outstanding proposed_tier, plus
+# a staleness sweep over old dakhil notes — read-only; approving/denying
+# is a human action in the renderer (M7, not yet built)
+curl -H "Authorization: Bearer $NULL_TOKEN" 'http://localhost:8080/mina'
 ```
 
 ### HTML reader
@@ -65,26 +75,43 @@ No editor, no JS, one stylesheet.
 ### MCP server
 
 For a language model to call the vault directly instead of going through
-HTTP — including writing to it. Eleven tools: `list_notes`, `get_note`,
+HTTP — including writing to it. Thirteen tools: `list_notes`, `get_note`,
 `search_notes`, `get_graph` mirror the HTTP routes; `find_relatives`
 (folder/tag siblings), `get_links` (one note's outlinks+backlinks in one
 call), and `find_path` (shortest link chain between two notes) are new,
-read-only, no HTTP equivalent; `create_note`, `write_note`, `delete_note`,
-and `push_vault` are the write path — always available, no configuration
-flag. Full contract in [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
+read-only, no HTTP equivalent; `create_note`, `write_note`, and
+`delete_note` are the write path — always available, no configuration
+flag; `tier_get`, `tier_set` (lowering-only), and `tier_propose` are the
+model's entire surface onto a note's curation tier — see
+[`spec/tiers.md`](spec/tiers.md). Full contract in
+[`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
 
 **`NULL_VAULT_PATH` must already be a git repository** — checked at boot.
 Every write touches exactly one file and never shares a commit with a
 different note: `"Add <path>"`, `"Update <path>"`, `"Delete <path>"`,
-plus an optional `reason` field appended to the message. That's the
-whole safety model — a bad write is one `git revert` away from gone,
-never entangled with anything else. One refinement: repeatedly editing
-the *same* note in a row amends the previous `write_note` commit instead
-of stacking a new one each time, so ten quick revisions in a session make
-one commit, not ten — the instant anything else gets committed in
-between, the chain breaks and the next edit starts fresh.
-`create_note`/`delete_note` never amend. `push_vault` is a separate,
-explicit tool; nothing reaches the remote until it's called on purpose.
+`"Set tier <path>"`, `"Propose tier <path>"`, plus an optional `reason`
+field appended to the message. That's the whole safety model — a bad
+write is one `git revert` away from gone, never entangled with anything
+else. One refinement: repeatedly editing the *same* note in a row amends
+the previous `write_note` commit instead of stacking a new one each
+time, so ten quick revisions in a session make one commit, not ten — the
+instant anything else gets committed in between, the chain breaks and
+the next edit starts fresh. Every other write always gets its own fresh
+commit, never amended.
+
+**There is no push or commit tool exposed to the model anywhere in this
+codebase.** The server commits on every write; nothing here ever reaches
+a remote by itself. Pushing is a human's own `git push`, in the vault
+clone, whenever they choose to. See `spec/tiers.md`'s "One door".
+
+**A note's curation tier only ever goes up via a human.** `create_note`
+always lands at `dakhil`, regardless of any `tier` field the caller
+passes — it's server-owned frontmatter and gets silently overwritten.
+`tier_set` can only lower a tier (any call that would raise or hold one
+fails loudly). Editing a `thabit` note with `write_note` demotes it to
+`amil` in the same commit. An `asil` note refuses every write, including
+from `write_note`/`delete_note` — enforced twice, once in the write path
+and once as an actual `0444` filesystem permission the index maintains.
 
 ```sh
 NULL_VAULT_PATH=/srv/null-vault go run ./cmd/nullmcp

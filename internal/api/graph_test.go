@@ -18,11 +18,13 @@ func TestGraphRoute(t *testing.T) {
 			Path     string `json:"path"`
 			Title    string `json:"title"`
 			Distance int    `json:"distance"`
+			Tier     string `json:"tier"`
 		} `json:"nodes"`
 		Edges []struct {
 			From    string `json:"from"`
 			To      string `json:"to"`
 			Context string `json:"context"`
+			Tier    string `json:"tier"`
 		} `json:"edges"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
@@ -34,9 +36,18 @@ func TestGraphRoute(t *testing.T) {
 	if len(resp.Nodes) != 2 || len(resp.Edges) != 4 {
 		t.Fatalf("nodes=%d edges=%d, want 2 and 4", len(resp.Nodes), len(resp.Edges))
 	}
+	// spec/tiers.md's explicit requirement: tier on every node and edge
+	for _, n := range resp.Nodes {
+		if n.Tier == "" {
+			t.Fatalf("node %s has no tier", n.Path)
+		}
+	}
 	for _, e := range resp.Edges {
 		if e.Context == "" {
 			t.Fatalf("edge %s->%s missing context", e.From, e.To)
+		}
+		if e.Tier == "" {
+			t.Fatalf("edge %s->%s missing tier", e.From, e.To)
 		}
 	}
 }

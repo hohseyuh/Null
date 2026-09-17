@@ -4,7 +4,8 @@ Model Context Protocol layer over the vault, for a language model to call
 directly instead of going through the JSON API. Same in-memory index as
 `nullapi`, second presentation of the read side — and, unlike `nullapi`,
 the vault's write path too. See CLAUDE.md's "Writes" section for the
-architectural commitment this implements.
+architectural commitment this implements, and `spec/tiers.md` for the
+curation-tier permission matrix every write here is subject to.
 
 **Binary:** `cmd/nullmcp`
 **Transport:** two modes, mutually exclusive, chosen by whether
@@ -35,14 +36,18 @@ calls a tool.
 
 ## Tools
 
-Eleven total: four mirror an HTTP route field-for-field (with one
+Thirteen total: four mirror an HTTP route field-for-field (with one
 addition — `list_notes` and `search_notes` results carry
 `approx_tokens`, `size_bytes / 4`, a rough heuristic, so the model can
-budget a `get_note` call before making it); three are new read
-capabilities with no HTTP equivalent (`find_relatives`, `get_links`,
-`find_path`); four are writes (`create_note`, `write_note`,
-`delete_note`, `push_vault`) — always registered, no configuration gate,
-since writing is now unconditional (see "Writes" below).
+budget a `get_note` call before making it, and both also carry `tier`
+on every entry); three are new read capabilities with no HTTP equivalent
+(`find_relatives`, `get_links`, `find_path`); three are writes
+(`create_note`, `write_note`, `delete_note`) — always registered, no
+configuration gate, since writing is now unconditional (see "Writes"
+below); three are the model's entire surface onto a note's curation tier
+(`tier_get`, `tier_set`, `tier_propose` — see "Tiers" below and
+`spec/tiers.md`). There is no fourteenth tool that pushes or commits —
+see "One door" in `spec/tiers.md`.
 
 ### `list_notes`
 
@@ -54,10 +59,14 @@ leak.
 |---|---|---|
 | `folder` | string | prefix filter |
 | `tags` | string[] | AND semantics |
+| `tier` | string | exact match: `dakhil`/`amil`/`thabit`/`asil` |
 | `updated_after` | string | ISO 8601 |
+| `updated_before` | string | ISO 8601 — e.g. a staleness sweep over old `dakhil` notes |
 | `limit` | int | 1–200, default 50 |
 | `cursor` | string | opaque, from a previous `next_cursor` |
 | `sort` | string | `path` \| `updated` (default) |
+
+Every result also carries `tier` — non-negotiable, per `spec/tiers.md`.
 
 ### `get_note`
 
@@ -75,18 +84,26 @@ capped at the same `NULL_MAX_BODY_BYTES` the HTTP API uses (default
 
 Mirrors `GET /v1/search`. Snippets only, same case- and
 diacritic-insensitive matching as the HTTP route (`sirr` matches `Şirr`).
+Score is weighted by tier (`spec/tiers.md`'s "Retrieval: weight, do not
+filter") — `dakhil` 0.4, `amil` 0.8, `thabit`/`asil` 1.0 — so raw capture
+still surfaces, just ranked below what's actually been reviewed.
 
 | field | type | notes |
 |---|---|---|
 | `query` | string | required |
 | `in` | string | `body` (default) \| `title` \| `both` |
-| `folder`, `tags` | | same as `list_notes` |
+| `folder`, `tags`, `tier` | | same as `list_notes` |
 | `limit` | int | 1–50, default 20 |
+
+Every result also carries `tier` — non-negotiable, per `spec/tiers.md`.
 
 ### `get_graph`
 
 Mirrors `GET /v1/graph`. BFS neighborhood; every edge carries the line its
-wikilink was written on.
+wikilink was written on. Every node carries its own tier; every edge
+carries the **lower** of its two endpoints' tiers — an edge is only as
+trustworthy as its weaker end (`spec/tiers.md`). Nothing is excluded by
+tier: `/graph` traverses every note regardless.
 
 | field | type | notes |
 |---|---|---|
@@ -141,7 +158,10 @@ Writes a brand-new note directly into the vault and commits it — `git
 add` + `git commit -m "Add <path>[, plus reason]" -- <path>`, exactly
 that one file, nothing else staged or swept in. Fails with a clear error
 if a note already exists at that path (never a silent overwrite); use
-`write_note` for that deliberately.
+`write_note` for that deliberately. Always lands at tier `dakhil` — any
+`tier`, `proposed_*`, `denied_*`, or `tier_history` key in the given
+frontmatter is silently stripped, never honored (R1: the model can never
+raise a tier, not even at creation).
 
 | field | type | notes |
 |---|---|---|
@@ -160,7 +180,13 @@ Overwrites an existing note wholesale — the given body and frontmatter
 replace what was there entirely, not a merge or a patch — and commits it
 as `"Update <path>"`. Fails if nothing exists yet at that path; use
 `create_note` for a new one. Same fields and `Refresh` behavior as
-`create_note`.
+`create_note`. Fails with a tool error if the note is `asil` — immutable
+to the model, no exception. If the note is `thabit`, this write demotes
+it to `amil` in the same commit (R2); the response's `demoted` field
+reports whether that fired, so the model can mention it once, plainly.
+`tier`, `proposed_*`, `denied_*`, and `tier_history` are carried forward
+from the note's current on-disk state regardless of what frontmatter the
+model supplies — a wholesale rewrite can never silently erase them.
 
 ### `delete_note`
 
@@ -169,23 +195,64 @@ the removal as `"Delete <path>"`. No confirmation step beyond the tool
 call itself: the commit *is* the confirmation, after the fact. Undoing a
 deletion is a single `git revert` of exactly that commit, never entangled
 with any other change, because there is never more than one change per
-commit.
+commit. Only permitted on a `dakhil` note — the permission matrix's one
+exception, since `dakhil` is the model's own working space; `amil`,
+`thabit`, and `asil` notes return a tool error instead.
 
 | field | type | notes |
 |---|---|---|
 | `path` | string | required |
 | `reason` | string | optional; appended to the commit message body |
 
-### `push_vault`
+### `tier_get`
 
-Pushes every local commit made by `create_note`/`write_note`/
-`delete_note` since the last push to the vault's configured git remote.
-No parameters. Deliberately separate from every write tool — nothing
-leaves this server until this is called on purpose. A rejected push
-(non-fast-forward, no remote configured, etc.) is reported as a tool
-error carrying git's own message; this tool never force-pushes and never
-attempts to resolve a conflict itself — that decision belongs to a human
-looking at the actual conflicting history.
+Read-only, always available. Current tier, when it last changed
+(`since` — the note's own `UpdatedAt`, since every tier change coincides
+with a write to the file), and any outstanding proposal.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+
+Returns `{path, tier, since, proposed?}`; `proposed`, when present, is
+`{tier, reason, at}` read straight off `proposed_tier`/`proposed_reason`/
+`proposed_at`.
+
+### `tier_set`
+
+**Lowering only.** Any call that would raise or hold a note's tier
+returns a tool error naming R1 — never a silent no-op, because a silent
+failure would teach the model the call worked. `reason` is required and
+is appended to the note's own `tier_history` in frontmatter (not just
+the commit message, so the audit trail survives even a shallow clone),
+in a commit of its own: `"Set tier <path>"`. Fails with a tool error if
+the note is `asil` — immutable, unconditionally, even to a call that
+would only lower it further.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+| `tier` | string | required; must be strictly lower than the current tier |
+| `reason` | string | required |
+
+### `tier_propose`
+
+Writes a proposal into the note's frontmatter — `proposed_tier`,
+`proposed_reason`, `proposed_at` — and changes nothing else: not the
+note's tier, not its body. Commits as `"Propose tier <path>"`. The user
+acts on it in **Al-Mina** (`GET /mina`, plus the renderer's approve/
+deny/defer screen — M7, not yet built). Fails with a tool error if the
+note already carries a `denied_tier` equal to the proposed tier and
+hasn't been written to since `denied_at` — without this, a denied
+proposal would resurface within days and Al-Mina would become a screen
+the user stops opening. Also fails if the note is `asil` — there is no
+tier above it to propose.
+
+| field | type | notes |
+|---|---|---|
+| `path` | string | required |
+| `tier` | string | required; the tier being proposed |
+| `reason` | string | required |
 
 ## Writes: the git-commit-per-note model
 
@@ -196,10 +263,11 @@ deliberately dropped in favor of git discipline enforced by the code:
 
 - **`internal/vault/write.go`** is the only file in this codebase that
   opens a vault file for anything but `O_RDONLY` — `CreateNote`,
-  `WriteNote`, `DeleteNote`, `PushVault`. A package-level mutex
-  (`gitMu`) serializes every stage-then-commit sequence, so two
+  `WriteNote`, `DeleteNote`, `SetTier`, `ProposeTier`. A package-level
+  mutex (`gitMu`) serializes every stage-then-commit sequence, so two
   concurrent tool calls can never interleave into a shared commit;
-  proven by `TestConcurrentWritesEachGetTheirOwnCommit`.
+  proven by `TestConcurrentWritesEachGetTheirOwnCommit`. None of them
+  ever calls `git push` — see "Tiers" below, "One door".
 - **`write_note` amends instead of stacking, when it safely can.** If
   the immediately-preceding commit (`HEAD`) is itself an unbroken
   `write_note` update to the *same* path — checked strictly: an exact
@@ -236,6 +304,34 @@ deliberately dropped in favor of git discipline enforced by the code:
   host vault directory as `nullapi`'s service, but without `:ro` — the
   one write-capable mount in the whole deployment. The Docker image
   needs `git` installed alongside `ripgrep` for this to work at all.
+
+## Tiers
+
+Full contract in `spec/tiers.md`; this section is the MCP-surface summary.
+Every note carries a curation tier — `dakhil` (default) / `amil` /
+`thabit` / `asil` — enforced entirely server-side, in
+`internal/vault/write.go` and `internal/vault/index.go`, never trusted to
+the model's instructions:
+
+- **R1 — the model can never raise a tier.** `create_note` always lands
+  at `dakhil`; `tier_set` can only lower; `tier_propose` only asks.
+  Promotion (`tier_set` going up, or `dakhil`→`amil` on a human's first
+  read in the renderer) is unreachable from every tool in this file.
+- **R2 — editing a `thabit` note demotes it to `amil`, atomically with
+  the edit.** `write_note` does this itself, in the same commit.
+- **`asil` is write-locked at the filesystem** (`0444`, maintained by the
+  index on every build/reparse), not just by the application-layer check
+  — so a bug in the latter still hits a real permission error.
+- **`tier`, `proposed_*`, `denied_*`, `tier_history` are server-owned.**
+  A model write that sets any of them has them stripped and replaced
+  with the server's own values, silently — the model has no legitimate
+  reason to set them and no feedback loop to learn from.
+- **No MCP tool here exposes `git push` or `git commit`, or a raw
+  filesystem write.** The server commits on write; nothing in this file
+  ever reaches a remote — see `spec/tiers.md`'s "One door". Earlier
+  drafts of this codebase had a `push_vault` tool; it was removed for
+  exactly this reason once tiers made "the model has no path to the
+  remote at all" the stricter, preferred guarantee.
 
 ## Error semantics
 
@@ -364,15 +460,17 @@ everywhere else in this stack: this binary does not do TLS.
 
 ## Deliberately absent from v0
 
-- **`nullapi`/the renderer writing.** The write path is `nullmcp` only —
-  see CLAUDE.md's non-negotiable #2 and "Writes" above.
-- **A promotion tool, in the old inbox-staging sense.** There's nothing
-  left to promote — `create_note`/`write_note`/`delete_note` already
-  write straight to the vault. What remains a deliberate human act is
-  `push_vault`: nothing reaches the remote without that explicit call.
-- **Force-push or automatic conflict resolution in `push_vault`.** A
-  rejected push is reported and stops there — resolving diverged history
-  is a human decision, not a default this tool guesses at.
+- **`nullapi`/the renderer writing note bodies.** The write path for note
+  content is `nullmcp` only — see CLAUDE.md's non-negotiable #2 and
+  "Writes" above. (Al-Mina's own approve/deny/defer actions are a
+  narrower, structured exception, scoped to the tier field alone — see
+  `spec/tiers.md` — and land in M7, not yet built.)
+- **A push or commit tool, of any shape.** Removed deliberately — see
+  "Tiers" above, "One door". Nothing in this codebase ever reaches a
+  remote by itself; pushing is a human's own `git push`.
+- **Any way for the model to raise a tier.** `tier_set` only lowers;
+  `tier_propose` only records an ask. Approving a proposal is a human
+  action in Al-Mina (M7), unreachable from every tool in this file.
 - **Any kind of write confirmation/review step inside the protocol.** Git
   *is* the review mechanism, after the fact (revert a bad commit) rather
   than before it lands. This was a deliberate choice, not an oversight —

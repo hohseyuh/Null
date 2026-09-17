@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -33,7 +34,7 @@ func testServer(t *testing.T) *sdkmcp.Server {
 
 // gitVaultServer builds a server over a git-initialized copy of the
 // fixture vault, for tests that call create_note/write_note/delete_note/
-// push_vault over a real protocol round trip.
+// tier_set/tier_propose over a real protocol round trip.
 func gitVaultServer(t *testing.T) (*sdkmcp.Server, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -75,7 +76,7 @@ func connect(t *testing.T, server *sdkmcp.Server) *sdkmcp.ClientSession {
 	return session
 }
 
-func TestServerAdvertisesAllElevenTools(t *testing.T) {
+func TestServerAdvertisesAllThirteenTools(t *testing.T) {
 	session := connect(t, testServer(t))
 	res, err := session.ListTools(context.Background(), nil)
 	if err != nil {
@@ -84,7 +85,8 @@ func TestServerAdvertisesAllElevenTools(t *testing.T) {
 	want := map[string]bool{
 		"list_notes": false, "get_note": false, "search_notes": false, "get_graph": false,
 		"find_relatives": false, "get_links": false, "find_path": false,
-		"create_note": false, "write_note": false, "delete_note": false, "push_vault": false,
+		"create_note": false, "write_note": false, "delete_note": false,
+		"tier_get": false, "tier_set": false, "tier_propose": false,
 	}
 	for _, tool := range res.Tools {
 		if _, ok := want[tool.Name]; ok {
@@ -243,17 +245,94 @@ func TestServerVaultWriteLifecycle(t *testing.T) {
 		t.Fatal("expected error for a traversal attempt")
 	}
 
-	// delete_note removes it
+	// delete_note removes it — it's still dakhil, so deletion is permitted
 	callTool(t, session, "delete_note", map[string]any{"path": "notes/thought.md", "reason": "done with it"}, nil)
 	if res := callTool(t, session, "get_note", map[string]any{"path": "notes/thought.md"}, nil); !res.IsError {
 		t.Fatal("expected error fetching a deleted note")
 	}
+}
 
-	// push_vault fails cleanly with no remote configured
-	res := callTool(t, session, "push_vault", map[string]any{}, nil)
-	if !res.IsError {
-		t.Fatal("expected push_vault to fail with no remote configured")
+// TestNoToolExposesGitOrFilesystemWrite is spec/tiers.md's "One door"
+// requirement, checked directly against the live tool registry rather
+// than trusted as a convention: no MCP tool here may commit, push, or
+// otherwise touch git/the filesystem directly on the model's behalf.
+func TestNoToolExposesGitOrFilesystemWrite(t *testing.T) {
+	session := connect(t, testServer(t))
+	res, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	denylist := []string{"push", "commit", "git", "exec", "shell", "filesystem"}
+	for _, tool := range res.Tools {
+		for _, bad := range denylist {
+			if strings.Contains(tool.Name, bad) {
+				t.Fatalf("tool %q exposes a %q-shaped capability directly to the model", tool.Name, bad)
+			}
+		}
+	}
+}
+
+// TestTierSetNeverRaises is R1 exercised over a real protocol round
+// trip: no call to tier_set can raise or hold a note's tier, at any
+// boundary.
+func TestTierSetNeverRaises(t *testing.T) {
+	server, _ := gitVaultServer(t)
+	session := connect(t, server)
+
+	// plain.md has no tier field, so it's dakhil by default
+	for _, tier := range []string{"dakhil", "amil", "thabit", "asil"} {
+		res := callTool(t, session, "tier_set", map[string]any{
+			"path": "plain.md", "tier": tier, "reason": "attempting a raise",
+		}, nil)
+		if !res.IsError {
+			t.Fatalf("tier_set to %q from dakhil should fail (raise or hold), got success", tier)
+		}
+	}
+}
+
+// TestWriteNoteRefusesAsil proves asil immutability holds even via a
+// direct write_note call, not just tier_set — the permission matrix's
+// strictest row.
+func TestWriteNoteRefusesAsil(t *testing.T) {
+	server, root := gitVaultServer(t)
+	session := connect(t, server)
+
+	callTool(t, session, "create_note", map[string]any{
+		"path": "foundational.md", "body": "# foundational\n",
+	}, nil)
+	// promote it to asil directly on disk, the way a human would via git —
+	// no tool in this server can do this itself, by design (R1)
+	promoteToAsil(t, root, "foundational.md")
+
+	res := callTool(t, session, "write_note", map[string]any{
+		"path": "foundational.md", "body": "# tampered\n",
+	}, nil)
+	if !res.IsError {
+		t.Fatal("expected write_note to fail against an asil note")
+	}
+
+	res = callTool(t, session, "delete_note", map[string]any{"path": "foundational.md"}, nil)
+	if !res.IsError {
+		t.Fatal("expected delete_note to fail against an asil note")
+	}
+}
+
+// promoteToAsil rewrites path's frontmatter to tier: asil directly on
+// disk and commits it — standing in for the human git action that is
+// the only way a note ever reaches asil.
+func promoteToAsil(t *testing.T, root, path string) {
+	t.Helper()
+	abs := root + "/" + path
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := "---\ntier: asil\n---\n\n" + string(data)
+	if err := os.WriteFile(abs, []byte(rewritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, root, "add", "-A")
+	runTestGit(t, root, "commit", "-q", "-m", "promote to asil")
 }
 
 func TestServerInvalidArgumentsRejectedBeforeHandler(t *testing.T) {

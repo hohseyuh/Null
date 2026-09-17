@@ -3,11 +3,20 @@ package vault
 import "sort"
 
 // GraphNode is one note reached by a graph traversal, with its BFS
-// distance from the root.
+// distance from the root and its curation tier.
 type GraphNode struct {
 	Path     string `json:"path"`
 	Title    string `json:"title"`
 	Distance int    `json:"distance"`
+	Tier     Tier   `json:"tier"`
+}
+
+// GraphEdge is one link in a graph traversal, carrying the lower of its
+// two endpoints' tiers — per spec/tiers.md, an edge is only as
+// trustworthy as its weaker end.
+type GraphEdge struct {
+	Edge
+	Tier Tier `json:"tier"`
 }
 
 // GraphResult is the neighborhood of one note. Nodes exclude the root
@@ -16,7 +25,7 @@ type GraphNode struct {
 type GraphResult struct {
 	Root  string
 	Nodes []GraphNode
-	Edges []Edge
+	Edges []GraphEdge
 }
 
 // Graph traverses the link graph from root by BFS up to depth hops.
@@ -25,7 +34,7 @@ type GraphResult struct {
 // by (from, to, line). It assumes root is an indexed path — callers check
 // existence first — and depth >= 1.
 func (ix *Index) Graph(root string, depth int, direction string) GraphResult {
-	res := GraphResult{Root: root, Nodes: []GraphNode{}, Edges: []Edge{}}
+	res := GraphResult{Root: root, Nodes: []GraphNode{}, Edges: []GraphEdge{}}
 
 	visited := map[string]int{root: 0}
 	frontier := []string{root}
@@ -34,6 +43,7 @@ func (ix *Index) Graph(root string, depth int, direction string) GraphResult {
 		line     int
 	}
 	seenEdge := map[edgeKey]struct{}{}
+	var rawEdges []Edge
 
 	for d := 0; d < depth && len(frontier) > 0; d++ {
 		var next []string
@@ -51,7 +61,7 @@ func (ix *Index) Graph(root string, depth int, direction string) GraphResult {
 					continue
 				}
 				seenEdge[k] = struct{}{}
-				res.Edges = append(res.Edges, e)
+				rawEdges = append(rawEdges, e)
 
 				// the far endpoint relative to p
 				other := e.To
@@ -67,18 +77,25 @@ func (ix *Index) Graph(root string, depth int, direction string) GraphResult {
 		frontier = next
 	}
 
+	tierOf := make(map[string]Tier, len(visited))
 	ix.mu.RLock()
 	for p, dist := range visited {
+		tier := TierDakhil
+		title := ""
+		if n, ok := ix.notes[p]; ok {
+			title, tier = n.Title, n.Tier
+		}
+		tierOf[p] = tier
 		if p == root {
 			continue
 		}
-		title := ""
-		if n, ok := ix.notes[p]; ok {
-			title = n.Title
-		}
-		res.Nodes = append(res.Nodes, GraphNode{Path: p, Title: title, Distance: dist})
+		res.Nodes = append(res.Nodes, GraphNode{Path: p, Title: title, Distance: dist, Tier: tier})
 	}
 	ix.mu.RUnlock()
+
+	for _, e := range rawEdges {
+		res.Edges = append(res.Edges, GraphEdge{Edge: e, Tier: LowerOf(tierOf[e.From], tierOf[e.To])})
+	}
 
 	sort.Slice(res.Nodes, func(i, j int) bool {
 		if res.Nodes[i].Distance != res.Nodes[j].Distance {

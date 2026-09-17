@@ -1,6 +1,6 @@
 # CLAUDE.md — Null
 
-A markdown vault served three ways: a read-only JSON API, a read-only HTML renderer, and an MCP layer that also reads and writes the vault directly, one git commit per note. This file is the standing context for every session in this repo.
+A markdown vault served three ways: a read-only JSON API, a read-only HTML renderer, and an MCP layer that also reads and writes the vault directly, one git commit per note. Every note carries a server-owned curation tier the model can lower or propose but never raise (`spec/tiers.md`). This file is the standing context for every session in this repo.
 
 ---
 
@@ -34,6 +34,7 @@ These are architectural commitments, not preferences. If a change would violate 
 4. **Path is the identity.** No UUIDs, no surrogate keys. `engineering/basim/soul.md` addresses that note everywhere, forever.
 5. **Never touch dotfiles or dot-directories.** `.git/` above all. Excluded from indexing and unreachable via any route.
 6. **The renderer shares the index.** It reads the same in-memory structures as the API — it does not call the API over HTTP, and it does not maintain a second parse. One process, two presentations.
+7. **The model never raises a tier, and never pushes or commits anything itself.** Every note carries a server-owned curation tier (dakhil/amil/thabit/asil — see "Tiers" below and `spec/tiers.md`); the permission matrix and R1/R2 are enforced inside `internal/vault/write.go`, never trusted to the model's instructions. No MCP tool in this codebase exposes `git commit`, `git push`, or a raw filesystem write — the server commits on write, and nothing here ever reaches a remote itself. See `spec/tiers.md`'s "One door".
 
 ## Writes
 
@@ -42,9 +43,22 @@ These are architectural commitments, not preferences. If a change would violate 
 - **Every write touches exactly one file, and never shares a commit with a different note.** `create_note` → "Add `<path>`"; `write_note` → "Update `<path>`"; `delete_note` → "Delete `<path>`". `internal/vault/write.go` serializes every stage-then-commit sequence behind a mutex so two concurrent tool calls can never land in the same commit. One refinement: `write_note` amends its own immediately-preceding commit when that commit was itself an unbroken `write_note` update to the same note — editing one note ten times in a row makes one commit, not ten. The moment anything else is committed in between, the chain breaks and the next edit starts fresh. `create_note`/`delete_note` never amend and are never amend targets, no exceptions.
 - **This is the undo mechanism.** A bad write is one `git revert` of one specific commit away from gone — never entangled with anything else, because there is never more than one change per commit. There is no confirmation step beyond the tool call itself; git *is* the confirmation step, after the fact.
 - **`NULL_VAULT_PATH` must already be a git repository.** Checked once at boot (`vault.EnsureGitRepo`) — a vault that isn't a git repo fails the server's startup, never a write attempt at runtime.
-- **Nothing pushes automatically.** `push_vault` is a separate, explicit tool. Local commits sit unpushed until it's called on purpose; it never force-pushes or resolves a conflict itself — a rejected push surfaces git's own error and stops there.
+- **Nothing here ever pushes.** There is no push or commit tool exposed to the model at all — see "Tiers" below and `spec/tiers.md`'s "One door". Local commits sit on the branch; a human pushes with their own `git push` when they choose to.
 
 Full contract in `spec/null-mcp-v0.md`.
+
+## Tiers
+
+Every note carries a curation tier in frontmatter — `dakhil` (model-created, uncurated, the default), `amil` (user aware, in progress), `thabit` (curated, reviewed), `asil` (foundational, immutable to the model). Full semantics, the permission matrix, and the build order are `spec/tiers.md`, which supersedes any earlier lake/warehouse framing — there is no lake, no warehouse, no `curated` boolean; tier is a field, not a path, and a note's folder never encodes it.
+
+The mechanism, enforced entirely in `internal/vault/write.go` and `internal/vault/index.go`, never in the model's instructions:
+
+- **R1 — the model can never raise a tier.** `create_note` always lands at `dakhil` regardless of what frontmatter it's given; `tier_set` can only lower a tier (any call that would raise or hold one fails loudly, never a silent no-op); `tier_propose` only writes a proposal for a human to act on in **Al-Mina**. Promotion — including `dakhil`→`amil`, which happens automatically the first time a human reads a note in the renderer — is never reachable from `nullmcp`.
+- **R2 — editing a `thabit` note demotes it to `amil`, atomically with the edit.** `write_note` does this itself, in the same commit; `write_note`'s response says so when it fires.
+- **`asil` is write-locked at the filesystem, not just by application logic.** `internal/vault/index.go`'s `enforceAsilLock` chmods any `asil` note `0444` on every index build and reparse — belt and braces: even a bug in the write-path's own tier check would still hit a permission error from the OS.
+- **`tier`, `proposed_*`, `denied_*`, and `tier_history` are server-owned frontmatter.** A model write that includes any of them has them silently stripped and replaced with the server's own values — never an error, since the model has no legitimate reason to set them.
+
+M6a–M6c (tier field + filters, the permission matrix, and `tier_get`/`tier_set`/`tier_propose` + `GET /mina`) are built. **M7 — the renderer's graph view, tier colours, and the Al-Mina review screen where a human actually approves/denies/defers a proposal — is not yet built.** Until it exists, a tier can only be raised by a human editing frontmatter directly via git, same as any other manual curation.
 
 ## Stack
 
@@ -65,13 +79,14 @@ cmd/nullapi/main.go       entrypoint, config, graceful shutdown
 cmd/nullmcp/main.go       MCP entrypoint, same vault/search wiring, stdio or HTTP transport
 internal/vault/           parse, index, watch — the core
   note.go                 Note struct, frontmatter + heading extraction
-  index.go                in-memory index, path→Note, link graph
+  tier.go                 Tier type, ranking, search weight, server-owned field stripping
+  index.go                in-memory index, path→Note, link graph, asil filesystem lock
   watcher.go              fsnotify, incremental reparse
-  write.go                CreateNote/WriteNote/DeleteNote/PushVault — the only writes
-                           anywhere, straight to the vault, each its own git commit
+  write.go                CreateNote/WriteNote/DeleteNote/SetTier/ProposeTier — the only
+                           writes anywhere, straight to the vault, each its own git commit
 internal/api/             handlers, middleware, DTOs
   routes.go               chi router
-  notes.go, search.go, graph.go
+  notes.go, search.go, graph.go, mina.go
   auth.go, errors.go
 internal/search/          ripgrep wrapper, result parsing
 internal/render/          html/template handlers, goldmark→HTML, wikilink rewriting
@@ -84,7 +99,7 @@ internal/mcp/             MCP tools over the same in-memory index — a second
   inspector.go             dev-only HTTP page for manual tool calls, opt-in via env
   http.go                  Streamable HTTP transport, bearer-token gated, opt-in via env
   oauth.go                 minimal OAuth 2.1 + DCR for spec-compliant remote clients (Claude.ai)
-spec/                     the specs below — read before implementing
+spec/                     the specs below — read before implementing, tiers.md above all
 ```
 
 ## Conventions
@@ -110,8 +125,10 @@ Every path from a request goes through one function before touching disk: reject
 
 ## Deliberately absent from v0
 
-Writes through `nullapi` or the renderer, of any kind — the write path is `nullmcp` only, always one commit per note (see "Writes" above) · in-browser editing · embeddings/RAG/chunking · a graph visualization · users, roles, sharing beyond the single static token · pagination beyond a cursor · rate limiting · metrics beyond request logs · any JS build step · automatic pushing — `push_vault` is always a separate, explicit call.
+Writes through `nullapi` or the renderer of any kind other than Al-Mina's own approve/deny/defer actions (M7, not yet built) — the general write path is `nullmcp` only, always one commit per note (see "Writes" above) · in-browser editing of note bodies · embeddings/RAG/chunking · users, roles, sharing beyond the single static token · pagination beyond a cursor · rate limiting · metrics beyond request logs · any JS build step beyond M7's own graph view · a push or commit tool exposed to the model — see "Tiers" above; nothing here ever reaches a remote itself.
 
-The renderer is a **reader**. The moment it grows a text box it has become an editor, and an editor is the iceberg — years of polish for something your local editor already does better.
+A graph visualization is no longer absent — `spec/tiers.md`'s M7 puts it in scope, the one deliberate exception to "no JS" in this codebase, not yet built.
+
+The renderer is a **reader**, with one narrow, structured exception: Al-Mina (M7) lets a human raise a tier or record a denial, nothing else. It still does not grow a text box for note bodies — that's the line. A general editor is the iceberg — years of polish for something your local editor already does better.
 
 Each is a real future need. None is specifiable before the vault has been used through this API for a fortnight.

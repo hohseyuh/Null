@@ -3,11 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"null-service/internal/search"
 	"null-service/internal/vault"
@@ -207,7 +210,9 @@ func TestSearchNotesSnippetsOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(titleOut.Results) != 1 || titleOut.Results[0].Path != "engineering/basim/soul.md" || titleOut.Results[0].Score != 1.0 {
+	// soul.md carries no tier field, so it's dakhil by default — a title
+	// match scores 1.0 before the tier weight (0.4 for dakhil) is applied.
+	if len(titleOut.Results) != 1 || titleOut.Results[0].Path != "engineering/basim/soul.md" || titleOut.Results[0].Score != 0.4 {
 		t.Fatalf("title search = %+v", titleOut.Results)
 	}
 }
@@ -424,51 +429,245 @@ func TestCreateWriteDeleteNoteLifecycle(t *testing.T) {
 	}
 }
 
-func TestPushVaultNoRemoteFailsCleanly(t *testing.T) {
-	tl := gitVaultTools(t) // no remote configured
-	out, err := tl.PushVault(context.Background(), PushVaultIn{})
-	if err == nil {
-		t.Fatal("expected an error pushing with no remote configured")
-	}
-	if out.Pushed {
-		t.Fatalf("Pushed = true on a failed push: %+v", out)
-	}
-}
-
-func TestPushVaultSucceeds(t *testing.T) {
-	tl := gitVaultTools(t)
-
-	// a bare repo to stand in for a real remote
-	remote := t.TempDir()
-	runTestGit(t, remote, "init", "-q", "--bare")
-	runTestGit(t, tl.VaultRoot, "remote", "add", "origin", remote)
-
-	branch := strings.TrimSpace(runTestGit(t, tl.VaultRoot, "branch", "--show-current"))
-	runTestGit(t, tl.VaultRoot, "push", "-q", "-u", "origin", branch) // establish upstream once, like a real clone would have
-
-	if _, err := tl.CreateNote(context.Background(), CreateNoteIn{Path: "pushed.md", Body: "# pushed\n"}); err != nil {
-		t.Fatal(err)
-	}
-
-	out, err := tl.PushVault(context.Background(), PushVaultIn{})
-	if err != nil {
-		t.Fatalf("PushVault: %v (output: %s)", err, out.Output)
-	}
-	if !out.Pushed {
-		t.Fatalf("Pushed = false: %+v", out)
-	}
-
-	// the remote actually has the commit now
-	remoteLog := runTestGit(t, remote, "log", "-1", "--pretty=%s")
-	if !strings.HasPrefix(remoteLog, "Add pushed.md") {
-		t.Fatalf("remote HEAD = %q, want the pushed commit", remoteLog)
-	}
-}
-
 func TestDeleteNoteErrorWrapping(t *testing.T) {
 	tl := gitVaultTools(t)
 	_, err := tl.DeleteNote(context.Background(), DeleteNoteIn{Path: "nope.md"})
 	if err == nil || !strings.Contains(err.Error(), "no such note") {
 		t.Fatalf("err = %v, want a clear 'no such note' message", err)
+	}
+}
+
+// setTierOnDisk rewrites path's frontmatter tier directly on disk and
+// commits it — standing in for the human git action that curates a
+// note, since no MCP tool here can ever raise a tier (R1).
+func setTierOnDisk(t *testing.T, root, path string, tier vault.Tier) {
+	t.Helper()
+	abs := root + "/" + path
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(data)
+	if rest, ok := strings.CutPrefix(body, "---\n"); ok {
+		if _, after, found := strings.Cut(rest, "\n---\n"); found {
+			body = after
+		}
+	}
+	rewritten := "---\ntier: " + string(tier) + "\n---\n\n" + body
+	if err := os.WriteFile(abs, []byte(rewritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, root, "add", "-A")
+	runTestGit(t, root, "commit", "-q", "-m", "curate "+path+" to "+string(tier))
+}
+
+func TestCreateNoteIgnoresModelSuppliedTier(t *testing.T) {
+	tl := gitVaultTools(t)
+	if _, err := tl.CreateNote(context.Background(), CreateNoteIn{
+		Path:        "sneaky.md",
+		Frontmatter: map[string]any{"tier": "asil"},
+		Body:        "# sneaky\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	n, ok := tl.Index.Get("sneaky.md")
+	if !ok {
+		t.Fatal("note not indexed")
+	}
+	if n.Tier != vault.TierDakhil {
+		t.Fatalf("tier = %q, want dakhil — the model-supplied tier must be stripped, not honored", n.Tier)
+	}
+}
+
+func TestWriteNoteDemotesThabitToAmil(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "reviewed.md", Body: "# reviewed\n\nv1\n"}); err != nil {
+		t.Fatal(err)
+	}
+	setTierOnDisk(t, tl.VaultRoot, "reviewed.md", vault.TierThabit)
+	if err := tl.Index.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := tl.WriteNote(ctx, WriteNoteIn{Path: "reviewed.md", Body: "# reviewed\n\nv2\n"})
+	if err != nil {
+		t.Fatalf("WriteNote: %v", err)
+	}
+	if !out.Demoted {
+		t.Fatal("Demoted = false, want true: editing a thabit note must demote it (R2)")
+	}
+	n, _ := tl.Index.Get("reviewed.md")
+	if n.Tier != vault.TierAmil {
+		t.Fatalf("tier after edit = %q, want amil — no window where it's edited and still thabit", n.Tier)
+	}
+}
+
+func TestDeleteNoteForbiddenAboveDakhil(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "curated.md", Body: "# curated\n"}); err != nil {
+		t.Fatal(err)
+	}
+	setTierOnDisk(t, tl.VaultRoot, "curated.md", vault.TierAmil)
+	if err := tl.Index.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tl.DeleteNote(ctx, DeleteNoteIn{Path: "curated.md"}); err == nil {
+		t.Fatal("expected error deleting a non-dakhil note")
+	}
+}
+
+func TestWriteNoteRefusesAsilAtEveryBoundary(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "foundational.md", Body: "# foundational\n"}); err != nil {
+		t.Fatal(err)
+	}
+	setTierOnDisk(t, tl.VaultRoot, "foundational.md", vault.TierAsil)
+	if err := tl.Index.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tl.WriteNote(ctx, WriteNoteIn{Path: "foundational.md", Body: "# tampered\n"}); err == nil {
+		t.Fatal("expected error writing an asil note")
+	}
+	if _, err := tl.DeleteNote(ctx, DeleteNoteIn{Path: "foundational.md"}); err == nil {
+		t.Fatal("expected error deleting an asil note")
+	}
+	// even via a traversal-safe but differently-cased/relative form —
+	// SafeRequestPath normalizes it to the same rel path either way
+	if _, err := tl.WriteNote(ctx, WriteNoteIn{Path: "./foundational.md", Body: "# still tampered\n"}); err == nil {
+		t.Fatal("expected error writing an asil note via a path that normalizes to it")
+	}
+}
+
+func TestTierGetReflectsCurrentTierAndProposal(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "watched.md", Body: "# watched\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := tl.TierGet(ctx, TierGetIn{Path: "watched.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Tier != "dakhil" || got.Proposed != nil {
+		t.Fatalf("got = %+v, want dakhil with no proposal", got)
+	}
+
+	if _, err := tl.TierPropose(ctx, TierProposeIn{Path: "watched.md", Tier: "amil", Reason: "worth surfacing"}); err != nil {
+		t.Fatalf("TierPropose: %v", err)
+	}
+	tl.Index.Refresh("watched.md")
+
+	got, err = tl.TierGet(ctx, TierGetIn{Path: "watched.md"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Proposed == nil || got.Proposed.Tier != "amil" || got.Proposed.Reason != "worth surfacing" {
+		t.Fatalf("proposed = %+v, want amil/worth surfacing", got.Proposed)
+	}
+}
+
+// TestTierSetEveryRaiseFails is R1 exercised at every tier boundary, not
+// just one — spec/tiers.md's explicit test requirement.
+func TestTierSetEveryRaiseFails(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		start, attempt vault.Tier
+	}{
+		{vault.TierDakhil, vault.TierDakhil}, // hold, not a lower
+		{vault.TierDakhil, vault.TierAmil},
+		{vault.TierAmil, vault.TierThabit},
+		{vault.TierThabit, vault.TierAsil},
+	}
+	for i, tt := range tests {
+		path := fmt.Sprintf("raise-%d.md", i)
+		if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: path, Body: "# x\n"}); err != nil {
+			t.Fatal(err)
+		}
+		if tt.start != vault.TierDakhil {
+			setTierOnDisk(t, tl.VaultRoot, path, tt.start)
+		}
+		if err := tl.Index.Build(); err != nil {
+			t.Fatal(err)
+		}
+		_, err := tl.TierSet(ctx, TierSetIn{Path: path, Tier: string(tt.attempt), Reason: "trying to raise"})
+		if err == nil {
+			t.Fatalf("case %d: tier_set from %s to %s should fail (raise or hold)", i, tt.start, tt.attempt)
+		}
+	}
+}
+
+func TestTierSetLowersAndRecordsHistory(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "lower-me.md", Body: "# x\n"}); err != nil {
+		t.Fatal(err)
+	}
+	setTierOnDisk(t, tl.VaultRoot, "lower-me.md", vault.TierThabit)
+	if err := tl.Index.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tl.TierSet(ctx, TierSetIn{Path: "lower-me.md", Tier: "dakhil", Reason: "was miscurated"}); err != nil {
+		t.Fatalf("TierSet: %v", err)
+	}
+	tl.Index.Refresh("lower-me.md")
+
+	n, _ := tl.Index.Get("lower-me.md")
+	if n.Tier != vault.TierDakhil {
+		t.Fatalf("tier = %q, want dakhil", n.Tier)
+	}
+	history, _ := n.Frontmatter["tier_history"].([]any)
+	if len(history) != 1 {
+		t.Fatalf("tier_history = %v, want exactly one entry", history)
+	}
+}
+
+func TestTierProposeRefusesUnexpiredDenial(t *testing.T) {
+	tl := gitVaultTools(t)
+	ctx := context.Background()
+	if _, err := tl.CreateNote(ctx, CreateNoteIn{Path: "denied.md", Body: "# x\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// simulate Al-Mina having denied a prior proposal to amil
+	abs := tl.VaultRoot + "/denied.md"
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deniedAt := time.Now().Add(-time.Hour)
+	rewritten := fmt.Sprintf("---\ndenied_tier: amil\ndenied_reason: not yet\ndenied_at: %s\n---\n\n%s",
+		deniedAt.UTC().Format(time.RFC3339), string(data))
+	if err := os.WriteFile(abs, []byte(rewritten), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, tl.VaultRoot, "add", "-A")
+	runTestGit(t, tl.VaultRoot, "commit", "-q", "-m", "deny proposal")
+	if err := os.Chtimes(abs, deniedAt, deniedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tl.Index.Build(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tl.TierPropose(ctx, TierProposeIn{Path: "denied.md", Tier: "amil", Reason: "asking again"}); err == nil {
+		t.Fatal("expected the unexpired denial to refuse the proposal")
+	}
+
+	// editing the note since the denial clears the way
+	if _, err := tl.WriteNote(ctx, WriteNoteIn{Path: "denied.md", Body: "# x\n\nnow with more content\n"}); err != nil {
+		t.Fatal(err)
+	}
+	tl.Index.Refresh("denied.md")
+	if _, err := tl.TierPropose(ctx, TierProposeIn{Path: "denied.md", Tier: "amil", Reason: "asking again, note has changed"}); err != nil {
+		t.Fatalf("TierPropose after an edit should succeed: %v", err)
 	}
 }

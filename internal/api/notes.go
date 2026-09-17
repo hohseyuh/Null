@@ -19,6 +19,7 @@ type noteSummary struct {
 	Path          string         `json:"path"`
 	Title         string         `json:"title"`
 	Tags          []string       `json:"tags"`
+	Tier          string         `json:"tier"`
 	Frontmatter   map[string]any `json:"frontmatter"`
 	UpdatedAt     time.Time      `json:"updated_at"`
 	SizeBytes     int64          `json:"size_bytes"`
@@ -50,7 +51,7 @@ func (s *Server) handleListNotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var updatedAfter time.Time
+	var updatedAfter, updatedBefore time.Time
 	if v := q.Get("updated_after"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -58,6 +59,22 @@ func (s *Server) handleListNotes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		updatedAfter = t
+	}
+	if v := q.Get("updated_before"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "bad_request", "updated_before must be ISO 8601 (RFC 3339)")
+			return
+		}
+		updatedBefore = t
+	}
+	var tier vault.Tier
+	if v := q.Get("tier"); v != "" {
+		tier = vault.Tier(v)
+		if !tier.Valid() {
+			writeError(w, http.StatusBadRequest, "bad_request", "tier must be one of dakhil, amil, thabit, asil")
+			return
+		}
 	}
 
 	folder := strings.TrimSuffix(q.Get("folder"), "/")
@@ -70,6 +87,12 @@ func (s *Server) handleListNotes(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if !updatedAfter.IsZero() && !n.UpdatedAt.After(updatedAfter) {
+			continue
+		}
+		if !updatedBefore.IsZero() && !n.UpdatedAt.Before(updatedBefore) {
+			continue
+		}
+		if tier != "" && n.Tier != tier {
 			continue
 		}
 		if !hasAllTags(n.Tags, tags) {
@@ -124,6 +147,7 @@ func (s *Server) summarize(n *vault.Note) noteSummary {
 		Path:          n.Path,
 		Title:         n.Title,
 		Tags:          tags,
+		Tier:          string(n.Tier),
 		Frontmatter:   n.Frontmatter,
 		UpdatedAt:     n.UpdatedAt,
 		SizeBytes:     n.SizeBytes,
@@ -146,6 +170,7 @@ func hasAllTags(have, want []string) bool {
 // route in the API allowed to carry a body.
 type noteResponse struct {
 	Path        string          `json:"path"`
+	Tier        string          `json:"tier"`
 	Frontmatter map[string]any  `json:"frontmatter"`
 	Body        *string         `json:"body,omitempty"`
 	Headings    []vault.Heading `json:"headings"`
@@ -190,6 +215,7 @@ func (s *Server) handleGetNote(w http.ResponseWriter, r *http.Request) {
 
 	resp := noteResponse{
 		Path:        n.Path,
+		Tier:        string(n.Tier),
 		Frontmatter: n.Frontmatter,
 		Headings:    n.Headings,
 		UpdatedAt:   n.UpdatedAt,

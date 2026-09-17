@@ -15,11 +15,12 @@ var serverInfo = &sdkmcp.Implementation{Name: "null", Version: "0.1.0"}
 // is a second presentation of the read API, not a second implementation
 // of it.
 //
-// All eleven tools are always registered — writes are unconditional now
+// All thirteen tools are always registered — writes are unconditional
 // (see CLAUDE.md non-negotiable #2 and vault/write.go's package doc):
 // every create_note, write_note, and delete_note is its own isolated git
-// commit, and push_vault is the one, deliberately separate, tool that
-// ever sends anything to the remote.
+// commit. There is no push or commit tool exposed to the model anywhere
+// in this server — see spec/tiers.md's "One door" — and no MCP path ever
+// raises a note's tier; tier_set only lowers, tier_propose only asks.
 func NewServer(t *Tools) *sdkmcp.Server {
 	s := sdkmcp.NewServer(serverInfo, nil)
 
@@ -111,8 +112,11 @@ func NewServer(t *Tools) *sdkmcp.Server {
 			"already exists at that path; use write_note to overwrite one on " +
 			"purpose. Commits immediately as its own isolated git commit — " +
 			"'Add <path>', plus reason if given — never bundled with any other " +
-			"change. The note is immediately visible to every read tool here; " +
-			"nothing leaves this server until push_vault is called separately.",
+			"change. The note is immediately visible to every read tool here. " +
+			"It starts at tier dakhil — the model's own working space — " +
+			"regardless of any tier field passed in frontmatter, which is " +
+			"ignored: tier is server-owned. This server never pushes to a " +
+			"remote itself; that stays a human's `git push`.",
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in CreateNoteIn) (*sdkmcp.CallToolResult, CreateNoteOut, error) {
 		out, err := t.CreateNote(ctx, in)
 		return nil, out, err
@@ -123,10 +127,14 @@ func NewServer(t *Tools) *sdkmcp.Server {
 		Description: "Overwrite an existing note wholesale — the given body and " +
 			"frontmatter replace what was there entirely, not a partial edit. " +
 			"Fails if nothing exists yet at that path; use create_note for a new " +
-			"note. Commits as 'Update <path>', plus reason if given — but if the " +
-			"very last thing committed was itself a write_note update to this " +
-			"same note, this amends that commit instead of stacking a new one, " +
-			"so editing the same note repeatedly in a row makes one commit, not " +
+			"note. Fails if the note is asil — immutable, no exception. If the " +
+			"note is thabit, this edit demotes it to amil in the same atomic " +
+			"write (R2: your prior review is now stale) — the response's " +
+			"demoted field reports this; mention it once, plainly, if it fires. " +
+			"Commits as 'Update <path>', plus reason if given — but if the very " +
+			"last thing committed was itself a write_note update to this same " +
+			"note, this amends that commit instead of stacking a new one, so " +
+			"editing the same note repeatedly in a row makes one commit, not " +
 			"one per call (only the latest reason is kept). Any other commit in " +
 			"between — a different note, a create, a delete — breaks that chain.",
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in WriteNoteIn) (*sdkmcp.CallToolResult, WriteNoteOut, error) {
@@ -136,27 +144,51 @@ func NewServer(t *Tools) *sdkmcp.Server {
 
 	sdkmcp.AddTool(s, &sdkmcp.Tool{
 		Name: "delete_note",
-		Description: "Delete a note from the vault. No confirmation step beyond " +
-			"this call — git is the undo mechanism, deliberately: the deletion is " +
-			"its own isolated commit ('Delete <path>', plus reason if given), so " +
-			"undoing it is a single, clean git revert of exactly that commit, " +
-			"never entangled with any other change.",
+		Description: "Delete a note from the vault. Only permitted on a dakhil " +
+			"note — the model's own working space; amil, thabit, and asil notes " +
+			"cannot be deleted this way. No confirmation step beyond this call " +
+			"— git is the undo mechanism, deliberately: the deletion is its own " +
+			"isolated commit ('Delete <path>', plus reason if given), so undoing " +
+			"it is a single, clean git revert of exactly that commit, never " +
+			"entangled with any other change.",
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in DeleteNoteIn) (*sdkmcp.CallToolResult, DeleteNoteOut, error) {
 		out, err := t.DeleteNote(ctx, in)
 		return nil, out, err
 	})
 
 	sdkmcp.AddTool(s, &sdkmcp.Tool{
-		Name: "push_vault",
-		Description: "Push every local commit made by create_note/write_note/" +
-			"delete_note since the last push to the vault's git remote. No " +
-			"parameters. Deliberately separate and explicit — no write tool " +
-			"pushes on its own, so nothing leaves this server until this is " +
-			"called on purpose. A rejected push (e.g. the remote has moved on) " +
-			"is reported as an error with git's own message; this never force-" +
-			"pushes or resolves a conflict itself.",
-	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in PushVaultIn) (*sdkmcp.CallToolResult, PushVaultOut, error) {
-		out, err := t.PushVault(ctx, in)
+		Name: "tier_get",
+		Description: "Get one note's current tier (dakhil/amil/thabit/asil), " +
+			"when it last changed, and any outstanding proposal. Read-only, " +
+			"always available.",
+	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in TierGetIn) (*sdkmcp.CallToolResult, TierGetOut, error) {
+		out, err := t.TierGet(ctx, in)
+		return nil, out, err
+	})
+
+	sdkmcp.AddTool(s, &sdkmcp.Tool{
+		Name: "tier_set",
+		Description: "Lower a note's tier — and only lower it. R1: the model " +
+			"can never raise a tier, not by this tool, not by any tool, not as " +
+			"a side effect; a call that would raise or hold the tier fails with " +
+			"an explicit error rather than silently doing nothing. Promotion is " +
+			"a human act, via Al-Mina. reason is required and is written into " +
+			"the note's own tier_history in frontmatter, not just the commit.",
+	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in TierSetIn) (*sdkmcp.CallToolResult, TierSetOut, error) {
+		out, err := t.TierSet(ctx, in)
+		return nil, out, err
+	})
+
+	sdkmcp.AddTool(s, &sdkmcp.Tool{
+		Name: "tier_propose",
+		Description: "Propose raising a note's tier, for the user to act on in " +
+			"Al-Mina. Writes proposed_tier/proposed_reason only — it does not " +
+			"change the note's actual tier or its body, and it is not itself a " +
+			"promotion. Refuses a proposal matching a denial the note already " +
+			"carries for the same target tier, unless the note has been edited " +
+			"since the denial.",
+	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in TierProposeIn) (*sdkmcp.CallToolResult, TierProposeOut, error) {
+		out, err := t.TierPropose(ctx, in)
 		return nil, out, err
 	})
 
