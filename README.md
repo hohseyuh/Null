@@ -74,12 +74,16 @@ and `push_vault` are the write path — always available, no configuration
 flag. Full contract in [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
 
 **`NULL_VAULT_PATH` must already be a git repository** — checked at boot.
-Every `create_note`/`write_note`/`delete_note` call becomes exactly one
-git commit, touching exactly one file: `"Add <path>"`, `"Update <path>"`,
-`"Delete <path>"`, plus an optional `reason` field appended to the
-message. That's the whole safety model — a bad write is one `git revert`
-away from gone, never entangled with anything else, because there's
-never more than one change per commit. `push_vault` is a separate,
+Every write touches exactly one file and never shares a commit with a
+different note: `"Add <path>"`, `"Update <path>"`, `"Delete <path>"`,
+plus an optional `reason` field appended to the message. That's the
+whole safety model — a bad write is one `git revert` away from gone,
+never entangled with anything else. One refinement: repeatedly editing
+the *same* note in a row amends the previous `write_note` commit instead
+of stacking a new one each time, so ten quick revisions in a session make
+one commit, not ten — the instant anything else gets committed in
+between, the chain breaks and the next edit starts fresh.
+`create_note`/`delete_note` never amend. `push_vault` is a separate,
 explicit tool; nothing reaches the remote until it's called on purpose.
 
 ```sh

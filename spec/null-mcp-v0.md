@@ -189,8 +189,8 @@ looking at the actual conflicting history.
 
 ## Writes: the git-commit-per-note model
 
-Every one of the four write tools ends in exactly one commit touching
-exactly one file — this is the whole safety model, replacing an earlier
+Every write touches exactly one file and never shares a commit with a
+different note — this is the whole safety model, replacing an earlier
 design (a physically separate inbox staging directory) that was
 deliberately dropped in favor of git discipline enforced by the code:
 
@@ -200,6 +200,22 @@ deliberately dropped in favor of git discipline enforced by the code:
   (`gitMu`) serializes every stage-then-commit sequence, so two
   concurrent tool calls can never interleave into a shared commit;
   proven by `TestConcurrentWritesEachGetTheirOwnCommit`.
+- **`write_note` amends instead of stacking, when it safely can.** If
+  the immediately-preceding commit (`HEAD`) is itself an unbroken
+  `write_note` update to the *same* path — checked strictly: an exact
+  `"Update <rel>"` header line, the tool's own `Source: nullmcp
+  write_note` trailer present, and `HEAD` touching nothing but `rel` —
+  the new content amends that commit rather than creating another one.
+  Editing one note ten times in a row inside one session produces one
+  commit, not ten. The chain breaks the instant anything else is
+  committed in between (a different note, a `create_note`, a
+  `delete_note`), and the next `write_note` starts fresh — proven by
+  `TestConsecutiveWriteNoteCallsCollapseIntoOneCommit` and
+  `TestWriteNoteDoesNotAmendAcrossADifferentCommit`. On each amend the
+  message is fully regenerated from the *current* call's `reason`, so
+  only the latest reason survives; stale ones from earlier edits in the
+  chain don't accumulate. `create_note` and `delete_note` never amend
+  and are never amend targets — `TestCreateAndDeleteNeverAmend`.
 - **`vault.EnsureGitRepo`** is checked once at `nullmcp` boot: a
   `NULL_VAULT_PATH` that isn't a git repository fails startup, never a
   write attempt at runtime.

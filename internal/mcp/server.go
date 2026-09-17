@@ -123,8 +123,12 @@ func NewServer(t *Tools) *sdkmcp.Server {
 		Description: "Overwrite an existing note wholesale — the given body and " +
 			"frontmatter replace what was there entirely, not a partial edit. " +
 			"Fails if nothing exists yet at that path; use create_note for a new " +
-			"note. Commits immediately as its own isolated git commit — " +
-			"'Update <path>', plus reason if given.",
+			"note. Commits as 'Update <path>', plus reason if given — but if the " +
+			"very last thing committed was itself a write_note update to this " +
+			"same note, this amends that commit instead of stacking a new one, " +
+			"so editing the same note repeatedly in a row makes one commit, not " +
+			"one per call (only the latest reason is kept). Any other commit in " +
+			"between — a different note, a create, a delete — breaks that chain.",
 	}, func(ctx context.Context, _ *sdkmcp.CallToolRequest, in WriteNoteIn) (*sdkmcp.CallToolResult, WriteNoteOut, error) {
 		out, err := t.WriteNote(ctx, in)
 		return nil, out, err
