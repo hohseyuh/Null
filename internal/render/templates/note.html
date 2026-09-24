@@ -1,11 +1,18 @@
 {{template "head" .}}
 <article>
   <header class="notehead">
-    <p class="path">{{.Note.Path}}</p>
+    <p class="path">{{.Note.Path}} <span class="chip t-{{.Note.Tier}}"><span class="dot"></span>{{.Note.Tier}}</span></p>
+    {{if .Promoted}}<p class="flash">Marked <b>amil</b> — you opened it, so it is no longer unseen.</p>{{end}}
+    {{if .Proposal}}<p class="flash proposal">Proposed for <b>{{.Proposal.Tier}}</b>{{if .Proposal.Reason}}: {{.Proposal.Reason}}{{end}} — <a href="/al-mina">review in Al-Mina</a></p>{{end}}
     {{if .Frontmatter}}
     <dl class="frontmatter">
       {{range .Frontmatter}}<div><dt>{{.Key}}</dt><dd>{{.Value}}</dd></div>{{end}}
     </dl>
+    {{end}}
+    {{if .History}}
+    <details class="history"><summary>tier history ({{len .History}})</summary>
+      <ol>{{range .History}}<li><time>{{.At}}</time> {{.From}} → {{.To}} <span class="by">({{.By}})</span>{{if .Reason}} — {{.Reason}}{{end}}</li>{{end}}</ol>
+    </details>
     {{end}}
   </header>
   <div class="body">

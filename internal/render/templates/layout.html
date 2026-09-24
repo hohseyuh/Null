@@ -10,10 +10,16 @@
 <header class="site">
   <nav>
     <a href="/" class="brand">Null</a>
+    <a href="/graph">Graph</a>
+    <a href="/al-mina" class="port">Al-Mina{{if .Header.Mina}} <span class="badge" title="items waiting">{{.Header.Mina}}</span>{{end}}</a>
     <form action="/s" method="get" class="searchbox">
       <input type="search" name="q" placeholder="search…" value="{{if .Query}}{{.Query}}{{end}}">
     </form>
   </nav>
+  <ul class="tiers" aria-label="notes per tier">
+    {{range .Header.Chips}}<li><a href="/?tier={{.Tier}}" class="chip t-{{.Tier}}"><span class="dot"></span>{{.Tier}} <b>{{.Count}}</b></a></li>
+    {{end}}
+  </ul>
 </header>
 <main>
 {{end}}

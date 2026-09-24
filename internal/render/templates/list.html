@@ -1,11 +1,12 @@
 {{template "head" .}}
-<h1>{{.Count}} notes</h1>
+<h1>{{.Count}} notes{{if .Tier}} <span class="chip t-{{.Tier}}"><span class="dot"></span>{{.Tier}}</span> <a class="clear" href="/">clear</a>{{end}}</h1>
 {{range .Groups}}
 <section class="folder">
   <h2>{{if .Folder}}{{.Folder}}{{else}}/{{end}}</h2>
   <ul class="notelist">
     {{range .Notes}}
     <li>
+      <span class="dot t-{{.Tier}}" title="{{.Tier}}"></span>
       <a href="{{noteURL .Path}}">{{.Title}}</a>
       <span class="meta">
         {{range .Tags}}<span class="tag">{{.}}</span>{{end}}

@@ -1,0 +1,10 @@
+{{template "head" .}}
+<div class="graphbar">
+  <h1>Graph</h1>
+  <div class="legend" id="legend" aria-label="tier filter"></div>
+  <span class="hint">scroll to zoom · drag to pan · click a node to open · hover for its name</span>
+</div>
+<div class="graphwrap"><canvas id="graph" aria-label="note graph"></canvas></div>
+<noscript><p class="empty">The graph view needs JavaScript — it is the one page that does.</p></noscript>
+<script src="/static/graph.js" defer></script>
+{{template "foot"}}

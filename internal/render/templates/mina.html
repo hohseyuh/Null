@@ -1,0 +1,39 @@
+{{template "head" .}}
+<h1>Al-Mina <small>الميناء — the port</small></h1>
+{{if or .Done .Failed}}<p class="flash">Applied <b>{{.Done}}</b>{{if .Failed}}, <b>{{.Failed}}</b> could not be applied (already handled, or the vault is not writable){{end}}.</p>{{end}}
+{{if not .Entries}}
+<p class="empty">Nothing is waiting. Proposals from the model, and dakhil notes left untouched for two weeks or more, appear here.</p>
+{{else}}
+{{if not .Writable}}<p class="flash warn">This vault is read-only here (not a git repository, or writes are off), so decisions cannot be applied.</p>{{end}}
+<form method="post" action="/al-mina/act" id="minaform" class="minaform">
+  <input type="hidden" name="csrf" value="{{.CSRF}}">
+  <p class="keys" id="keys">Keyboard: <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>a</kbd> approve · <kbd>d</kbd> deny · <kbd>f</kbd> defer · <kbd>s</kbd> skip · <kbd>Enter</kbd> apply all</p>
+  <ol class="queue">
+  {{range .Entries}}
+    <li class="entry {{.Type}}" data-path="{{.Path}}">
+      <div class="entryhead">
+        <a href="{{noteURL .Path}}">{{.Title}}</a>
+        <span class="path">{{.Path}}</span>
+        <span class="age">{{printf "%.0f" .AgeDays}}d</span>
+      </div>
+      {{if eq .Type "proposal"}}
+      <p class="move"><span class="chip t-{{.Tier}}"><span class="dot"></span>{{.Tier}}</span> → <span class="chip t-{{.ProposedTier}}"><span class="dot"></span>{{.ProposedTier}}</span>{{if .ChangedSinceReview}} <span class="changed">edited since last review</span>{{end}}</p>
+      {{if .Reason}}<blockquote class="why">{{.Reason}}</blockquote>{{end}}
+      <div class="choices">
+        <label><input type="radio" name="act:{{.Path}}" value="approve"> approve</label>
+        <label><input type="radio" name="act:{{.Path}}" value="deny"> deny</label>
+        <label><input type="radio" name="act:{{.Path}}" value="defer"> defer</label>
+        <label><input type="radio" name="act:{{.Path}}" value="skip" checked> skip</label>
+        <input type="text" class="denyreason" name="reason:{{.Path}}" placeholder="why denied (optional)">
+      </div>
+      {{else}}
+      <p class="move"><span class="chip t-dakhil"><span class="dot"></span>dakhil</span> untouched — <a href="{{noteURL .Path}}">open it</a> to mark it amil, or leave it</p>
+      {{end}}
+    </li>
+  {{end}}
+  </ol>
+  <p><button type="submit"{{if not .Writable}} disabled{{end}}>Apply decisions</button></p>
+</form>
+<script src="/static/mina.js" defer></script>
+{{end}}
+{{template "foot"}}

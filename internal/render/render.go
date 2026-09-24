@@ -4,11 +4,13 @@
 package render
 
 import (
+	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -20,19 +22,30 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"null-service/internal/search"
+	"null-service/internal/session"
 	"null-service/internal/vault"
 )
 
 //go:embed templates/*.html
 var templateFS embed.FS
 
-//go:embed static/style.css
-var styleCSS []byte
+//go:embed static
+var staticFS embed.FS
 
 // cookieName holds the bearer token for browsers; set by GET /login.
-const cookieName = "null_token"
+const cookieName = session.CookieName
 
-// Renderer serves the HTML views. All fields must be set before Mount.
+// contentSecurityPolicy is sent on every page. Note bodies are rendered
+// as raw HTML (a model can author them), and this renderer performs
+// vault writes, so an injected script must never run: only our own
+// embedded scripts load, nothing inline, no frames, no objects, and
+// forms may only post back to this origin.
+const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; " +
+	"img-src 'self' data: https:; connect-src 'self'; form-action 'self'; " +
+	"frame-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+
+// Renderer serves the HTML views. Index, Search, VaultRoot, Token and Log
+// must be set (New does); Writable is opt-in.
 type Renderer struct {
 	Index     *vault.Index
 	Search    *search.Searcher
@@ -40,8 +53,15 @@ type Renderer struct {
 	Token     string
 	Log       *slog.Logger
 
-	tmpl      *template.Template
-	tokenHash [32]byte
+	// Writable enables the renderer's only writes: Al-Mina's approve/
+	// deny/defer and the dakhil->amil promotion on a human's first open.
+	// Off by default — the vault must be a git repository for any write to
+	// commit, and tests over the read-only fixture vault must never write.
+	Writable bool
+
+	tmpl  *template.Template
+	guard *session.Guard
+	csrf  string
 }
 
 // New parses the embedded templates and returns a Renderer ready to
@@ -63,70 +83,76 @@ func New(ix *vault.Index, s *search.Searcher, root, token string, log *slog.Logg
 		Token:     token,
 		Log:       log,
 		tmpl:      tmpl,
-		tokenHash: sha256.Sum256([]byte(token)),
+		guard:     session.NewGuard(token),
+		csrf:      csrfToken(token),
 	}, nil
+}
+
+// csrfToken derives the form token from the login token, so it needs no
+// storage and survives restarts. It is embedded only in Al-Mina's and
+// the setup page's own forms; a note body cannot learn it (CSP blocks
+// scripts, and pages are same-origin only), so a form injected into a
+// note cannot forge a POST.
+func csrfToken(token string) string {
+	m := hmac.New(sha256.New, []byte(token))
+	m.Write([]byte("null-csrf-v1"))
+	return hex.EncodeToString(m.Sum(nil))
 }
 
 // Mount registers the HTML routes on r. /login is the only unauthenticated
 // route; everything else requires the bearer token, via header or cookie.
 func (rd *Renderer) Mount(r chi.Router) {
-	r.Get("/login", rd.handleLogin)
+	r.Get("/login", rd.guard.Login)
 	r.Group(func(r chi.Router) {
-		r.Use(rd.requireToken)
+		r.Use(rd.guard.Require)
+		r.Use(securityHeaders)
 		r.Get("/", rd.handleList)
 		r.Get("/n/*", rd.handleNote)
 		r.Get("/s", rd.handleSearch)
-		r.Get("/static/style.css", func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			w.Write(styleCSS)
-		})
+		r.Get("/graph", rd.handleGraph)
+		r.Get("/graph/data", rd.handleGraphData)
+		r.Get("/al-mina", rd.handleMina)
+		r.Post("/al-mina/act", rd.handleMinaAct)
+		sub, _ := fs.Sub(staticFS, "static")
+		r.Handle("/static/*", http.StripPrefix("/static/", http.FileServerFS(sub)))
 	})
 }
 
-// requireToken accepts the API bearer header or the login cookie, both
-// compared constant-time against the configured token.
-func (rd *Renderer) requireToken(next http.Handler) http.Handler {
+func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		candidate := ""
-		if h, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
-			candidate = h
-		} else if c, err := r.Cookie(cookieName); err == nil {
-			candidate = c.Value
-		}
-		got := sha256.Sum256([]byte(candidate))
-		if subtle.ConstantTimeCompare(got[:], rd.tokenHash[:]) != 1 {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprint(w, `<!doctype html><meta charset="utf-8"><title>401</title>`+
-				`<body style="background:#14161a;color:#c9cdd3;font:16px/1.6 system-ui;padding:4rem">`+
-				`<p>Unauthorized. Visit <code>/login?token=&lt;token&gt;</code> once; a cookie will keep you in.</p>`)
-			return
-		}
+		w.Header().Set("Content-Security-Policy", contentSecurityPolicy)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
 
-// handleLogin sets the token cookie so a browser can hold the bearer
-// token. Deliberately not a form — the token travels in the query string
-// exactly once, over TLS in deployment.
-func (rd *Renderer) handleLogin(w http.ResponseWriter, r *http.Request) {
-	got := sha256.Sum256([]byte(r.URL.Query().Get("token")))
-	if subtle.ConstantTimeCompare(got[:], rd.tokenHash[:]) != 1 {
-		http.Error(w, "invalid token", http.StatusUnauthorized)
-		return
+// tierChip is one tier's count in the always-visible header.
+type tierChip struct {
+	Tier  string
+	Count int
+}
+
+// headerData is the accumulation check shown on every page: how many
+// notes sit at each tier, and how deep Al-Mina's queue is. Colour
+// discriminates at fifty nodes and fails at eight hundred; a number
+// scales.
+func (rd *Renderer) headerData() map[string]any {
+	counts := rd.Index.TierCounts()
+	chips := make([]tierChip, 0, 4)
+	for _, t := range []vault.Tier{vault.TierDakhil, vault.TierAmil, vault.TierThabit, vault.TierAsil} {
+		chips = append(chips, tierChip{Tier: string(t), Count: counts[t]})
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    r.URL.Query().Get("token"),
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		Secure:   r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https",
-	})
-	http.Redirect(w, r, "/", http.StatusSeeOther)
+	return map[string]any{
+		"Chips": chips,
+		"Mina":  len(vault.MinaQueue(rd.Index, vault.MinaStaleDays(), time.Now())),
+	}
 }
 
 func (rd *Renderer) render(w http.ResponseWriter, status int, name string, data any) {
+	if m, ok := data.(map[string]any); ok {
+		m["Header"] = rd.headerData()
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := rd.tmpl.ExecuteTemplate(w, name, data); err != nil {
@@ -142,9 +168,18 @@ type folderGroup struct {
 
 // handleList serves GET /: every note, grouped by folder, newest first
 // within each group.
-func (rd *Renderer) handleList(w http.ResponseWriter, _ *http.Request) {
+func (rd *Renderer) handleList(w http.ResponseWriter, r *http.Request) {
+	tier := vault.Tier(r.URL.Query().Get("tier"))
+	if !tier.Valid() {
+		tier = ""
+	}
 	byFolder := map[string][]*vault.Note{}
+	count := 0
 	for _, n := range rd.Index.All() {
+		if tier != "" && n.Tier != tier {
+			continue
+		}
+		count++
 		dir := path.Dir(n.Path)
 		if dir == "." {
 			dir = ""
@@ -166,7 +201,8 @@ func (rd *Renderer) handleList(w http.ResponseWriter, _ *http.Request) {
 	rd.render(w, http.StatusOK, "list.html", map[string]any{
 		"Title":  "Null",
 		"Groups": groups,
-		"Count":  rd.Index.Len(),
+		"Count":  count,
+		"Tier":   string(tier),
 	})
 }
 
@@ -185,13 +221,50 @@ func (rd *Renderer) handleNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	promoted := rd.markOpened(r, n)
+	if promoted {
+		n, _ = rd.Index.Get(rel) // re-read: the tier just changed
+	}
+
 	rd.render(w, http.StatusOK, "note.html", map[string]any{
 		"Title":       n.Title,
 		"Note":        n,
 		"Frontmatter": frontmatterRows(n.Frontmatter),
+		"History":     tierHistory(n.Frontmatter),
+		"Proposal":    vault.ProposalFrom(n.Frontmatter),
+		"Promoted":    promoted,
 		"Body":        rd.markdown(n.Body),
 		"Backlinks":   rd.Index.Backlinks(n.Path),
 	})
+}
+
+// markOpened promotes a dakhil note to amil when a human opens it: the
+// read is exactly the evidence tier 2 claims, and the model cannot forge
+// it because it counts only genuine, user-activated browser navigations.
+// That means a cookie session (never the Authorization header a program
+// uses) AND Sec-Fetch-User: ?1 with Sec-Fetch-Dest: document — which an
+// <img>, <iframe>, script, prefetch, or meta-refresh planted inside a
+// model-written note can never produce. A client that sends no Sec-Fetch
+// headers at all simply never promotes; the safe default. It reports
+// whether the note was promoted. Failures are logged, never shown — a
+// read must not fail because a promotion did.
+func (rd *Renderer) markOpened(r *http.Request, n *vault.Note) bool {
+	if !rd.Writable || n.Tier != vault.TierDakhil || !session.ViaCookie(r) {
+		return false
+	}
+	h := r.Header
+	if h.Get("Sec-Fetch-User") != "?1" || h.Get("Sec-Fetch-Dest") != "document" || h.Get("Sec-Fetch-Mode") != "navigate" {
+		return false
+	}
+	promoted, err := vault.MarkOpened(rd.VaultRoot, n.Path)
+	if err != nil {
+		rd.Log.Error("promote on first open", "path", n.Path, "err", err)
+		return false
+	}
+	if promoted {
+		rd.Index.Refresh(n.Path)
+	}
+	return promoted
 }
 
 func (rd *Renderer) notFound(w http.ResponseWriter) {
@@ -242,6 +315,9 @@ type frontmatterRow struct {
 func frontmatterRows(fm map[string]any) []frontmatterRow {
 	rows := make([]frontmatterRow, 0, len(fm))
 	for k, v := range fm {
+		if k == "tier_history" {
+			continue // rendered as its own list
+		}
 		rows = append(rows, frontmatterRow{Key: k, Value: flatten(v)})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Key < rows[j].Key })
@@ -259,4 +335,23 @@ func flatten(v any) string {
 	default:
 		return fmt.Sprint(v)
 	}
+}
+
+// historyRow is one tier_history entry, for display.
+type historyRow struct{ At, From, To, Reason, By string }
+
+// tierHistory reads a note's tier_history frontmatter, oldest first as
+// stored. Entries that aren't the expected shape are skipped.
+func tierHistory(fm map[string]any) []historyRow {
+	raw, _ := fm["tier_history"].([]any)
+	rows := make([]historyRow, 0, len(raw))
+	for _, e := range raw {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		str := func(k string) string { s, _ := m[k].(string); return s }
+		rows = append(rows, historyRow{At: str("at"), From: str("from"), To: str("to"), Reason: str("reason"), By: str("by")})
+	}
+	return rows
 }

@@ -110,18 +110,24 @@ func EnsureGitRepo(root string) error {
 	return nil
 }
 
+// GitIdentity is the default commit author name for this process — the
+// binary's own name, so `git log` shows which of nullmcp or nullapi made
+// a commit. Set once at startup, before any write.
+var GitIdentity = "nullmcp"
+
 // gitIdentityEnv returns GIT_AUTHOR_*/GIT_COMMITTER_* environment
 // entries for the git subprocess, so commits succeed regardless of
 // whether the running environment has any git identity configured on
-// disk. NULL_MCP_GIT_NAME/NULL_MCP_GIT_EMAIL override the defaults.
+// disk. NULL_GIT_NAME/NULL_GIT_EMAIL (or the older NULL_MCP_GIT_NAME/
+// NULL_MCP_GIT_EMAIL) override the defaults.
 func gitIdentityEnv() []string {
-	name := os.Getenv("NULL_MCP_GIT_NAME")
+	name := firstEnv("NULL_GIT_NAME", "NULL_MCP_GIT_NAME")
 	if name == "" {
-		name = "nullmcp"
+		name = GitIdentity
 	}
-	email := os.Getenv("NULL_MCP_GIT_EMAIL")
+	email := firstEnv("NULL_GIT_EMAIL", "NULL_MCP_GIT_EMAIL")
 	if email == "" {
-		email = "nullmcp@localhost"
+		email = GitIdentity + "@localhost"
 	}
 	return []string{
 		"GIT_AUTHOR_NAME=" + name, "GIT_AUTHOR_EMAIL=" + email,
@@ -129,11 +135,33 @@ func gitIdentityEnv() []string {
 	}
 }
 
+func firstEnv(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// runGit runs one git command in root. gitMu serializes writers inside a
+// process, but nullapi (Al-Mina) and nullmcp are separate processes
+// sharing one vault: when the other one holds git's own index.lock this
+// briefly retries instead of failing the write — git's lock guarantees
+// they never corrupt each other, only that one has to wait its turn.
 func runGit(root string, args ...string) (string, error) {
 	fullArgs := append(append([]string{"-C", root}, gitSafeDirectoryArgs...), args...)
-	cmd := exec.Command("git", fullArgs...)
-	cmd.Env = append(os.Environ(), gitIdentityEnv()...)
-	out, err := cmd.CombinedOutput()
+	var out []byte
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		cmd := exec.Command("git", fullArgs...)
+		cmd.Env = append(os.Environ(), gitIdentityEnv()...)
+		out, err = cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "index.lock") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	return string(out), err
 }
 
@@ -275,6 +303,20 @@ func readCurrentNote(root, rel string) (*Note, string, error) {
 		return nil, abs, fmt.Errorf("read %s: %w", rel, err)
 	}
 	return Parse(rel, raw, st.ModTime(), nil), abs, nil
+}
+
+// rewriteBody returns cur's body ready to hand back to serialize when
+// only the frontmatter is changing. serialize puts one blank line between
+// the closing fence and the body, and Parse keeps that blank line as the
+// body's first byte — so a body read from a note that already has a fence
+// must lose exactly one leading newline, or every metadata-only rewrite
+// (a tier change, a proposal) would add another blank line under the
+// fence, forever.
+func rewriteBody(cur *Note) string {
+	if cur.BodyLine > 1 {
+		return strings.TrimPrefix(cur.Body, "\n")
+	}
+	return cur.Body
 }
 
 // writeFile truncates and rewrites abs's contents in place. Shared by
@@ -489,7 +531,7 @@ func SetTier(root, rel string, target Tier, reason string) error {
 	fm["tier"] = string(target)
 	appendTierHistory(fm, current.Tier, target, reason, "tier_set")
 
-	content, err := serialize(fm, current.Body)
+	content, err := serialize(fm, rewriteBody(current))
 	if err != nil {
 		return err
 	}
@@ -531,7 +573,9 @@ func ProposeTier(root, rel string, target Tier, reason string) error {
 		// mtime can look nanoseconds "after" its own denied_at — truncate
 		// both to the second before comparing, or a proposal could be
 		// resubmitted in the same instant it was denied.
-		if !current.UpdatedAt.Truncate(time.Second).After(denial.At) {
+		// The two-second slack covers a deny-write whose mtime lands in the
+		// next second after its own denied_at was stamped.
+		if !current.UpdatedAt.Truncate(time.Second).After(denial.At.Add(2 * time.Second)) {
 			return ErrProposalDenied
 		}
 	}
@@ -544,7 +588,7 @@ func ProposeTier(root, rel string, target Tier, reason string) error {
 	fm["proposed_reason"] = reason
 	fm["proposed_at"] = timeString(time.Now())
 
-	content, err := serialize(fm, current.Body)
+	content, err := serialize(fm, rewriteBody(current))
 	if err != nil {
 		return err
 	}
