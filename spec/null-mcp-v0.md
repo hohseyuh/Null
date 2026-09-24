@@ -241,7 +241,7 @@ Writes a proposal into the note's frontmatter — `proposed_tier`,
 `proposed_reason`, `proposed_at` — and changes nothing else: not the
 note's tier, not its body. Commits as `"Propose tier <path>"`. The user
 acts on it in **Al-Mina** (`GET /mina`, plus the renderer's approve/
-deny/defer screen — M7, not yet built). Fails with a tool error if the
+deny/defer screen at `/al-mina`). Fails with a tool error if the
 note already carries a `denied_tier` equal to the proposed tier and
 hasn't been written to since `denied_at` — without this, a denied
 proposal would resurface within days and Al-Mina would become a screen
@@ -464,13 +464,14 @@ everywhere else in this stack: this binary does not do TLS.
   content is `nullmcp` only — see CLAUDE.md's non-negotiable #2 and
   "Writes" above. (Al-Mina's own approve/deny/defer actions are a
   narrower, structured exception, scoped to the tier field alone — see
-  `spec/tiers.md` — and land in M7, not yet built.)
+  `spec/tiers.md`, implemented in `internal/vault/human.go` and referenced
+  only from `internal/render`.)
 - **A push or commit tool, of any shape.** Removed deliberately — see
   "Tiers" above, "One door". Nothing in this codebase ever reaches a
   remote by itself; pushing is a human's own `git push`.
 - **Any way for the model to raise a tier.** `tier_set` only lowers;
   `tier_propose` only records an ask. Approving a proposal is a human
-  action in Al-Mina (M7), unreachable from every tool in this file.
+  action in Al-Mina, unreachable from every tool in this file.
 - **Any kind of write confirmation/review step inside the protocol.** Git
   *is* the review mechanism, after the fact (revert a bad commit) rather
   than before it lands. This was a deliberate choice, not an oversight —

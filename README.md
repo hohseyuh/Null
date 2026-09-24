@@ -1,41 +1,105 @@
-# null-service
+# Null
 
-A plain-markdown vault, served three ways from the same in-memory index:
-a JSON API, a server-rendered HTML reader, and an MCP server that also
-writes to the vault directly. The vault stays canonical on disk; delete
-this server and nothing is lost. Every note carries a curation tier —
-`dakhil`/`amil`/`thabit`/`asil` — that the model can lower or propose but
-never raise; see [`spec/tiers.md`](spec/tiers.md).
+A plain-markdown knowledge vault, served three ways from one in-memory
+index: a **JSON API**, a **server-rendered web reader** (with a graph view
+and a review screen), and an **MCP server** that lets a language model read
+*and write* the vault. The vault stays plain files under git — delete this
+server and nothing is lost.
 
-## Requirements
+What makes it different from "a notes API" is the trust model. Every note
+carries a **curation tier** — `dakhil` (model-written, unseen), `amil`
+(you've opened it), `thabit` (you reviewed it), `asil` (foundational) — and
+the rules about it are enforced by the server, not requested of the model:
 
-- Go 1.22+
-- `ripgrep` on PATH (`/search` shells out to it; boot fails loudly without it)
+- the model can **never raise a tier**; it can only lower one or *propose* a
+  promotion for you to accept or reject in a review screen called **Al-Mina**;
+- editing a `thabit` note demotes it to `amil` in the same commit;
+- an `asil` note is read-only to the model, and write-locked (`0444`) on disk;
+- every model write is exactly **one git commit for one note**, so any bad
+  write is one `git revert` away from gone;
+- the model gets **no push or commit tool at all**.
 
-## Configuration (env only)
+Full design: [`spec/tiers.md`](spec/tiers.md). Working notes for contributors
+and coding agents: [`CLAUDE.md`](CLAUDE.md).
 
-| var | required | default | meaning |
-|---|---|---|---|
-| `NULL_VAULT_PATH` | yes | — | vault root directory |
-| `NULL_TOKEN` | yes | — | static bearer token |
-| `NULL_ADDR` | no | `:8080` | listen address |
-| `NULL_MAX_BODY_BYTES` | no | `200000` | single-note body cap; larger bodies 413 and point at `?section=` |
+## Quick start
 
-## Run
+You need [Go](https://go.dev) 1.22+, [`ripgrep`](https://github.com/BurntSushi/ripgrep)
+and `git` on your PATH.
 
 ```sh
-NULL_VAULT_PATH=/srv/null-vault NULL_TOKEN=$(openssl rand -hex 32) go run ./cmd/nullapi
+git clone <this repo> && cd null-service
+
+# two secrets: the API token, and a separate one for the browser UI
+export NULL_TOKEN=$(openssl rand -hex 32)
+export NULL_UI_TOKEN=$(openssl rand -hex 32)
+
+go run ./cmd/nullapi
 ```
 
-## Routes
+Open `http://localhost:8080/login?token=<NULL_UI_TOKEN>` once, then you are
+sent to **`/setup`**: pick the folder that holds your notes (browsing is
+limited to your home directory; change that with `NULL_BROWSE_ROOT`). The
+choice is remembered in a config file and applied immediately — no restart.
+Or skip the page and set `NULL_VAULT_PATH=/path/to/vault`, which fixes the
+vault and makes `/setup` read-only.
 
-All `/v1` routes except `/v1/health` require `Authorization: Bearer $NULL_TOKEN`.
+The vault should be a git repository (`git init` in it) — reading works
+either way, but every write (the model's, and your Al-Mina decisions) is a
+commit, so they need one.
+
+Try it with the bundled sample vault: `NULL_VAULT_PATH=$PWD/testdata/vault`.
+
+## Configuration
+
+Everything is environment variables.
+
+| var | default | meaning |
+|---|---|---|
+| `NULL_TOKEN` | — (required) | bearer token for the JSON API |
+| `NULL_UI_TOKEN` | `NULL_TOKEN` | token for the browser UI, Al-Mina and `/setup`. **Set it separately** if any program or model holds the API token — otherwise that program can log in and approve its own proposals. A boot warning tells you when it is unset. |
+| `NULL_VAULT_PATH` | unset | vault root. Set: fixed, `/setup` read-only. Unset: the saved choice, else setup mode |
+| `NULL_CONFIG_PATH` | user config dir `/null/config.json` | where `/setup` saves the choice (mode 0600) |
+| `NULL_BROWSE_ROOT` | `$HOME` | the only area `/setup` may browse |
+| `NULL_ADDR` | `:8080` | listen address |
+| `NULL_MAX_BODY_BYTES` | `200000` | single-note body cap; larger bodies 413 and point at `?section=` |
+| `NULL_MINA_STALE_DAYS` | `14` | age at which an untouched `dakhil` note surfaces in Al-Mina |
+| `NULL_GIT_NAME` / `NULL_GIT_EMAIL` | binary name / `<name>@localhost` | author of commits the server makes |
+
+Nothing terminates TLS: put a reverse proxy in front for anything beyond
+localhost.
+
+## The web reader
+
+Log in once with `/login?token=<NULL_UI_TOKEN>` (sets an HttpOnly cookie).
+
+- `/` — every note grouped by folder, tier dot on each; `?tier=amil` filters
+- `/n/{path}` — the note; wikilinks clickable, backlinks with context, tier history
+- `/s?q=` — search with highlighted snippets
+- `/graph` — the whole vault as a force-directed graph. Colour is the tier;
+  edges touching a `dakhil` note are dashed (an edge is only as trustworthy as
+  its weaker end). Scroll to zoom, drag to pan, click a node to open it.
+- `/al-mina` — the port: the model's tier proposals with its reason inline,
+  plus stale `dakhil` notes. Approve / deny / defer in one batch; keyboard-driven
+  (`j`/`k` move, `a` `d` `f` `s` decide, `Enter` applies). Works without
+  JavaScript too.
+- The header always shows how many notes sit at each tier, and how many items
+  wait in Al-Mina.
+
+Opening a `dakhil` note in the browser marks it `amil` — your reading is the
+evidence tier 2 claims. Only a real, user-initiated page load counts; an API
+call, a prefetch, or an image tag inside a note cannot.
+
+The only JavaScript is two small hand-written files (`graph.js`, `mina.js`).
+There is no build step.
+
+## The JSON API
+
+All `/v1` routes except `/v1/health` need `Authorization: Bearer $NULL_TOKEN`.
+Responses are compact JSON, and every note entry carries its `tier`.
 
 ```sh
-# health — the only open route
-curl http://localhost:8080/v1/health
-
-# list notes: metadata only, never bodies; every entry carries its tier
+# list notes: metadata only, never bodies
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/notes?folder=engineering/&tag=spec&sort=updated&limit=50'
 curl -H "Authorization: Bearer $NULL_TOKEN" \
@@ -47,169 +111,91 @@ curl -H "Authorization: Bearer $NULL_TOKEN" \
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/notes/engineering/basim/soul.md?section=Failure%20modes'
 
-# search: snippets, never bodies; case- and diacritic-insensitive (sirr matches Şirr)
+# search: snippets, never bodies; case- and diacritic-insensitive (sirr matches Şirr).
+# Scores are weighted by tier — raw capture is ranked below reviewed notes, not hidden.
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/search?q=sirr&in=body&limit=20'
 
-# graph: BFS neighborhood; every edge carries the line its wikilink was
-# written on and the lower of its two endpoints' tiers
+# graph: BFS neighborhood; each edge has the line its wikilink was written on
+# and the lower of its two endpoints' tiers
 curl -H "Authorization: Bearer $NULL_TOKEN" \
   'http://localhost:8080/v1/graph?path=engineering/basim/soul.md&depth=2&direction=both'
 
-# Al-Mina's proposal queue: notes with an outstanding proposed_tier, plus
-# a staleness sweep over old dakhil notes — read-only; approving/denying
-# is a human action in the renderer (M7, not yet built)
+# Al-Mina's queue as JSON (read-only; deciding happens in the browser)
 curl -H "Authorization: Bearer $NULL_TOKEN" 'http://localhost:8080/mina'
 ```
 
-### HTML reader
+The API never writes. Contract: [`spec/null-read-api-v0.md`](spec/null-read-api-v0.md).
 
-Same token, held by a cookie: open `/login?token=$NULL_TOKEN` once, then
+## The MCP server
 
-- `/` — note list grouped by folder
-- `/n/{path}` — the note; wikilinks are clickable, backlinks listed with context
-- `/s?q=` — search with highlighted snippets
+For a language model to use the vault directly. Thirteen tools:
+`list_notes`, `get_note`, `search_notes`, `get_graph`, `find_relatives`,
+`get_links`, `find_path` (read); `create_note`, `write_note`, `delete_note`
+(write); `tier_get`, `tier_set` (lowering only), `tier_propose`. Full
+contract: [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
 
-No editor, no JS, one stylesheet.
-
-### MCP server
-
-For a language model to call the vault directly instead of going through
-HTTP — including writing to it. Thirteen tools: `list_notes`, `get_note`,
-`search_notes`, `get_graph` mirror the HTTP routes; `find_relatives`
-(folder/tag siblings), `get_links` (one note's outlinks+backlinks in one
-call), and `find_path` (shortest link chain between two notes) are new,
-read-only, no HTTP equivalent; `create_note`, `write_note`, and
-`delete_note` are the write path — always available, no configuration
-flag; `tier_get`, `tier_set` (lowering-only), and `tier_propose` are the
-model's entire surface onto a note's curation tier — see
-[`spec/tiers.md`](spec/tiers.md). Full contract in
-[`spec/null-mcp-v0.md`](spec/null-mcp-v0.md).
-
-**`NULL_VAULT_PATH` must already be a git repository** — checked at boot.
-Every write touches exactly one file and never shares a commit with a
-different note: `"Add <path>"`, `"Update <path>"`, `"Delete <path>"`,
-`"Set tier <path>"`, `"Propose tier <path>"`, plus an optional `reason`
-field appended to the message. That's the whole safety model — a bad
-write is one `git revert` away from gone, never entangled with anything
-else. One refinement: repeatedly editing the *same* note in a row amends
-the previous `write_note` commit instead of stacking a new one each
-time, so ten quick revisions in a session make one commit, not ten — the
-instant anything else gets committed in between, the chain breaks and
-the next edit starts fresh. Every other write always gets its own fresh
-commit, never amended.
-
-**There is no push or commit tool exposed to the model anywhere in this
-codebase.** The server commits on every write; nothing here ever reaches
-a remote by itself. Pushing is a human's own `git push`, in the vault
-clone, whenever they choose to. See `spec/tiers.md`'s "One door".
-
-**A note's curation tier only ever goes up via a human.** `create_note`
-always lands at `dakhil`, regardless of any `tier` field the caller
-passes — it's server-owned frontmatter and gets silently overwritten.
-`tier_set` can only lower a tier (any call that would raise or hold one
-fails loudly). Editing a `thabit` note with `write_note` demotes it to
-`amil` in the same commit. An `asil` note refuses every write, including
-from `write_note`/`delete_note` — enforced twice, once in the write path
-and once as an actual `0444` filesystem permission the index maintains.
+`nullmcp` needs the vault to be a git repository (checked at boot). It reads
+the same saved vault choice as `nullapi`, or `NULL_VAULT_PATH`.
 
 ```sh
-NULL_VAULT_PATH=/srv/null-vault go run ./cmd/nullmcp
+NULL_VAULT_PATH=/path/to/vault go run ./cmd/nullmcp      # stdio
 ```
 
-Speaks stdio — point a client (Claude Desktop, Claude Code, etc.) at the
-binary as a subprocess, e.g. in Claude Desktop's config:
+Point a client such as Claude Desktop at the binary:
 
 ```json
-{
-  "mcpServers": {
-    "null": {
-      "command": "/path/to/nullmcp",
-      "env": { "NULL_VAULT_PATH": "/srv/null-vault" }
-    }
-  }
-}
+{ "mcpServers": { "null": {
+    "command": "/path/to/nullmcp",
+    "env": { "NULL_VAULT_PATH": "/path/to/vault" } } } }
 ```
 
-No `NULL_TOKEN` needed here — stdio's trust boundary is the OS process
-that spawns the binary.
-
-#### Remote clients (e.g. Claude.ai's connector settings)
-
-For a client that can't spawn a local subprocess, set `NULL_MCP_HTTP_ADDR`
-to switch to the Streamable HTTP transport instead of stdio — never both
-in the same process; see `spec/null-mcp-v0.md`'s "HTTP transport" section
-for why. `NULL_TOKEN` and `NULL_MCP_PUBLIC_URL` (this server's own public
-HTTPS origin — needed for OAuth discovery, see below) are then required:
+**Remote clients** (e.g. Claude.ai's connector settings) can't spawn a
+process, so `NULL_MCP_HTTP_ADDR` switches to Streamable HTTP with OAuth 2.1 +
+dynamic client registration wrapped around one secret. It needs `NULL_TOKEN`
+and `NULL_MCP_PUBLIC_URL` (the public https origin your reverse proxy exposes):
 
 ```sh
-NULL_VAULT_PATH=/srv/null-vault NULL_MCP_HTTP_ADDR=127.0.0.1:8092 \
-  NULL_TOKEN=$(openssl rand -hex 32) \
-  NULL_MCP_PUBLIC_URL=https://your-host:10000 go run ./cmd/nullmcp
+NULL_VAULT_PATH=/path/to/vault NULL_MCP_HTTP_ADDR=127.0.0.1:8092 \
+  NULL_TOKEN=$(openssl rand -hex 32) NULL_MCP_PUBLIC_URL=https://your-host \
+  go run ./cmd/nullmcp
 ```
 
-Two ways to authenticate against `https://your-host:10000/mcp`, both
-described in full in `spec/null-mcp-v0.md`'s OAuth section:
+Give the client `https://your-host/mcp`; it discovers the rest and asks you to
+type the token once, in the browser. Use a *different* token from
+`NULL_UI_TOKEN`. For poking at tools by hand, `NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090`
+serves a dev-only page (no auth — loopback only).
 
-- **A plain client** (curl, testing, anything that doesn't need OAuth):
-  `Authorization: Bearer <NULL_TOKEN>`, directly.
-- **Claude.ai's connector settings**, or any MCP-authorization-spec-
-  compliant client: it self-registers and discovers the flow on its own
-  (`.well-known/oauth-protected-resource` → `.well-known/oauth-
-  authorization-server` → `/register` → `/authorize` → `/token`) — just
-  give it the `/mcp` URL. The one thing you'll do by hand is type
-  `NULL_TOKEN` into the `/authorize` page's form once, in the browser,
-  when the client opens it.
-
-This process only ever binds loopback; a reverse proxy (this repo's own
-deployment uses Tailscale Funnel) is what makes it reachable from
-anywhere else, and terminates TLS. This binary never does.
-
-To poke at the tools by hand during development, set
-`NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090` and open that address — a
-server-rendered, zero-JS page that calls tools over a real MCP session.
-Dev-only, no auth, keep it on loopback.
-
-## Tests
-
-```sh
-go test ./...            # needs ripgrep installed
-go test ./... -race      # watcher concurrency
-```
+There is deliberately **no push or commit tool**. The server commits on every
+write; you push with your own `git push` when you choose.
 
 ## Deploy
 
-Docker (vault mounted read-only, enforced twice — `:ro` mount and
-`O_RDONLY`-only opens in code):
+Docker, vault fixed by the environment:
 
 ```sh
-echo "NULL_TOKEN=$(openssl rand -hex 32)" > .env
-echo "VAULT_PATH=/srv/null-vault" >> .env
-docker compose up -d --build
-
-# verify the mount really is read-only
-docker compose exec nullapi sh -c 'mount | grep vault && touch /vault/x; echo exit=$?'
-# expect: ...(ro,...) and "Read-only file system", exit=1
-```
-
-`compose.yaml` also has an `nullmcp` service (same image, different
-entrypoint) for the HTTP transport — add to `.env` and it starts
-alongside `nullapi`, mounting the *same* `VAULT_PATH` but read-write
-(nullapi's mount stays `:ro`; nullmcp's does not — see "MCP server"
-above). `VAULT_PATH` must already be a git repository before you start
-this service — `git init && git add -A && git commit -m seed`, if it
-isn't one yet:
-
-```sh
-echo "NULL_MCP_TOKEN=$(openssl rand -hex 32)" >> .env   # separate from NULL_TOKEN, deliberately
-echo "NULL_MCP_PUBLIC_URL=https://your-host:10000" >> .env
+cp .env.example .env    # then fill in the secrets
 docker compose up -d --build
 ```
 
-Bare metal: `deploy/nullapi.service` (systemd, `DynamicUser`,
-`ReadOnlyPaths=` on the vault). Terminate TLS in your reverse proxy;
-the service listens on loopback.
+Or choose the vault in the browser (`compose.setup.yaml`, see its header).
+Both mount the vault **read-write** — the model's writes and your Al-Mina
+decisions are git commits made inside the container. The vault directory
+must be a git repository. Bare metal: `deploy/nullapi.service` (systemd).
 
-Vault sync is `git pull` in the vault clone (cron or push webhook) — the
-fsnotify watcher picks the changes up, batched behind a debounce. No
-reload endpoint exists because none is needed.
+Vault sync from your own machine is `git pull` in the vault clone; the
+file watcher notices and re-indexes.
+
+## Development
+
+```sh
+go build ./... && go vet ./...
+go test ./... -race     # needs ripgrep and git
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security-relevant behaviour and how
+to report a problem: [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE).

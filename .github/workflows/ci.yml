@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -race -count=1
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t null-service:ci .
+      - name: Validate compose files
+        env:
+          NULL_TOKEN: x
+          NULL_MCP_TOKEN: y
+          NULL_MCP_PUBLIC_URL: https://example.test
+          VAULT_PATH: /tmp
+          VAULTS_DIR: /tmp
+        run: |
+          docker compose -f compose.yaml config -q
+          docker compose -f compose.setup.yaml --profile mcp config -q

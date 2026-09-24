@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+.claude
+vault
+vaults
+null-vault
+nullapi
+nullmcp
+*.md

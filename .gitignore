@@ -1,3 +1,33 @@
+# built binaries (anchored: an unanchored "nullapi" would also match cmd/nullapi/)
 /nullapi
 /nullmcp
+/bin/
+/dist/
 
+# secrets and local configuration — never commit these
+.env
+.env.*
+!.env.example
+null-config.json
+config.json
+*.pem
+*.key
+
+# a real vault must never live inside this repo (the fixture under
+# testdata/ is the only notes this repo carries)
+/vault/
+/vaults/
+/null-vault/
+/notes/
+
+# tooling and editors
+.claude/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# go
+*.test
+*.out
+coverage.*
