@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — Null</title>
+<link rel="stylesheet" href="/setup/style.css">
+</head>
+<body>
+<main>
+  <h1>Choose your vault</h1>
+  <p class="lead">Null serves a folder of plain markdown files. Pick the folder that holds yours.</p>
+
+  {{if .Saved}}<div class="msg ok">Vault selected. <a href="/">Open it →</a></div>{{end}}
+  {{if .Warn}}<div class="msg warn">{{.Warn}}</div>{{end}}
+  {{if .Err}}<div class="msg err">{{.Err}}</div>{{end}}
+
+  <div class="card">
+    <strong>Current vault:</strong>
+    {{if .Current}}<code>{{.Current}}</code>{{else}}<span class="dim">none chosen yet</span>{{end}}
+  </div>
+
+  {{if .Locked}}
+  <div class="msg warn"><code>NULL_VAULT_PATH</code> is set in this server's environment, so the vault is fixed and cannot be changed from here. Unset it (and restart) to choose in the browser.</div>
+  {{else if .L}}
+  <div class="card">
+    <div class="crumbs">{{range .L.Crumbs}}<a href="/setup?dir={{.Path | urlquery}}">{{.Name}}</a>{{end}}</div>
+    {{if .L.Subdirs}}
+    <ul class="dirs">
+      {{range .L.Subdirs}}<li><a href="/setup?dir={{.Path | urlquery}}">{{.Name}}/</a>{{if .IsGit}} <span class="tag">git</span>{{end}}</li>
+      {{end}}
+    </ul>
+    {{else}}<p class="dim">No subfolders here.</p>{{end}}
+  </div>
+
+  <div class="card">
+    <p><code>{{.L.Dir}}</code><br>
+    <span class="dim">{{.L.Notes}}{{if .L.NotesCapped}}+{{end}} markdown note(s) inside</span></p>
+    {{if .NoGit}}<div class="msg warn">This folder is not a git repository. You can read it, but the model's writes and your Al-Mina decisions are each committed to git, so they will fail here. Run <code>git init</code> in it first if you want them.</div>{{end}}
+    <form method="post" action="/setup">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="dir" value="{{.L.Dir}}">
+      <button type="submit">Use this folder as the vault</button>
+    </form>
+  </div>
+  <p class="dim">You can only browse inside <code>{{.Root}}</code> (set <code>NULL_BROWSE_ROOT</code> to change that).</p>
+  {{end}}
+</main>
+</body>
+</html>

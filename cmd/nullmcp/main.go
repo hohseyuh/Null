@@ -47,6 +47,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	appconfig "null-service/internal/config"
 	nullmcp "null-service/internal/mcp"
 	"null-service/internal/search"
 	"null-service/internal/vault"
@@ -65,8 +66,15 @@ type config struct {
 // called once at startup and fails hard on anything missing or
 // malformed.
 func loadConfig() (config, error) {
+	// The vault comes from NULL_VAULT_PATH, or failing that from the file
+	// nullapi's /setup page saves — so a vault chosen in the browser is the
+	// one the model writes to, too (read once, at boot).
+	vaultPath, _, err := appconfig.VaultPath(appconfig.Path())
+	if err != nil {
+		return config{}, err
+	}
 	cfg := config{
-		vaultPath:     os.Getenv("NULL_VAULT_PATH"),
+		vaultPath:     vaultPath,
 		maxBodyBytes:  200_000,
 		inspectorAddr: os.Getenv("NULL_MCP_INSPECTOR_ADDR"),
 		httpAddr:      os.Getenv("NULL_MCP_HTTP_ADDR"),
@@ -74,9 +82,9 @@ func loadConfig() (config, error) {
 		publicURL:     strings.TrimSuffix(os.Getenv("NULL_MCP_PUBLIC_URL"), "/"),
 	}
 	if cfg.vaultPath == "" {
-		return cfg, errors.New("NULL_VAULT_PATH is required")
+		return cfg, errors.New("no vault configured: set NULL_VAULT_PATH, or choose one in nullapi's /setup page (this reads the same saved config)")
 	}
-	if err := requireDir("NULL_VAULT_PATH", cfg.vaultPath); err != nil {
+	if err := requireDir("vault", cfg.vaultPath); err != nil {
 		return cfg, err
 	}
 	// Every write commits, so the vault must already be a git repository —

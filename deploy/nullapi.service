@@ -3,7 +3,7 @@
 #   config:  systemctl edit nullapi   (override the Environment lines)
 #   run:     systemctl enable --now nullapi
 [Unit]
-Description=Null read-only vault API
+Description=Null vault API and reader
 After=network-online.target
 Wants=network-online.target
 
@@ -12,17 +12,21 @@ Type=simple
 ExecStart=/usr/local/bin/nullapi
 Environment=NULL_VAULT_PATH=/srv/null-vault
 Environment=NULL_ADDR=127.0.0.1:8080
-# Put NULL_TOKEN in a root-owned file instead of the unit:
+# Put NULL_TOKEN (and, separately, NULL_UI_TOKEN) in a root-owned file
+# instead of the unit:
 EnvironmentFile=/etc/nullapi/env
 Restart=on-failure
 RestartSec=2
 
-# Hardening: the service cannot write anywhere it doesn't own,
-# and the vault is explicitly read-only even if the code regressed.
-DynamicUser=yes
+# Hardening. The vault is the one place the service writes (Al-Mina's tier
+# commits), so it is listed in ReadWritePaths and the user that owns the
+# vault must be the one this runs as — a DynamicUser cannot commit into a
+# repository it does not own. Create a dedicated user and chown the vault:
+#   useradd --system null && chown -R null /srv/null-vault
+User=null
 ProtectSystem=strict
-ProtectHome=read-only
-ReadOnlyPaths=/srv/null-vault
+ReadWritePaths=/srv/null-vault
+ProtectHome=true
 PrivateTmp=yes
 NoNewPrivileges=yes
 
