@@ -31,3 +31,8 @@ config.json
 *.test
 *.out
 coverage.*
+
+# clauded docs
+docs/
+spec/
+CLAUDE.md
