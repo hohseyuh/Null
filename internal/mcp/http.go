@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -66,8 +67,54 @@ func NewHTTPHandler(server *sdkmcp.Server, oauth *OAuthServer, staticToken strin
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	})
-	return mux
+	return logRequests(mux, log)
 }
+
+// logRequests logs one line per request — method, path, status, duration
+// and User-Agent — and nothing else. Never the query string (/authorize
+// carries state and PKCE values), never a header value other than
+// User-Agent, never a body: no token or credential can reach a log. It
+// exists so an operator can tell whether a remote client's setup check ever
+// reached this server at all, which is otherwise invisible behind a proxy.
+// A nil log disables it.
+func logRequests(next http.Handler, log *slog.Logger) http.Handler {
+	if log == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: w}
+		start := time.Now()
+		next.ServeHTTP(rec, r)
+		if rec.status == 0 {
+			rec.status = http.StatusOK
+		}
+		log.Info("request", "method", r.Method, "path", r.URL.Path, "status", rec.status,
+			"duration_ms", time.Since(start).Milliseconds(), "ua", r.UserAgent())
+	})
+}
+
+// statusRecorder captures the status code while staying transparent to
+// streaming: the MCP transport uses Flush for server-sent events, and
+// Unwrap lets http.ResponseController reach the real writer.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 // requireBearerHTTP accepts the raw static token or a valid OAuth
 // access token oauth issued, constant-time either way. On rejection it

@@ -10,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // oauthUnderTest starts a server over an httptest listener, the way
@@ -164,8 +166,8 @@ func TestOAuthBadStateFileNeverStopsBoot(t *testing.T) {
 // right credential, a refresh, and unauthenticated /mcp hits, capturing
 // everything the server logs, and look for any token or the secret.
 func TestNoSecretsReachTheLogs(t *testing.T) {
-	var buf bytes.Buffer
-	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	state := filepath.Join(t.TempDir(), "oauth.json")
 	oauth, ts := oauthUnderTest(t, state, log)
 
@@ -185,6 +187,7 @@ func TestNoSecretsReachTheLogs(t *testing.T) {
 		}
 	}
 
+	time.Sleep(100 * time.Millisecond) // let the last request's log line land
 	logs := buf.String()
 	for name, secret := range map[string]string{
 		"the shared secret": "secret", "an access token": access, "a refresh token": refresh,
@@ -198,5 +201,60 @@ func TestNoSecretsReachTheLogs(t *testing.T) {
 		if strings.Contains(logs, needle) {
 			t.Errorf("%s appeared in the server's logs:\n%s", name, logs)
 		}
+	}
+}
+
+// The request log must show what reached the server without breaking the
+// MCP transport's streaming, and without ever recording a query string.
+func TestRequestLogShowsPathAndStatusOnly(t *testing.T) {
+	buf := &syncBuffer{}
+	log := slog.New(slog.NewTextHandler(buf, nil))
+	_, ts := oauthUnderTest(t, "", log)
+
+	init := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`
+	req, _ := http.NewRequest("POST", ts.URL+"/mcp?probe=SECRETQUERY", strings.NewReader(init))
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("User-Agent", "probe-agent/1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("authenticated initialize through the logging wrapper = %d, want 200", resp.StatusCode)
+	}
+	buf.waitFor("status=200")
+	logs := buf.String()
+	for _, want := range []string{"method=POST", "path=/mcp", "status=200", "ua=probe-agent/1"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("request log missing %q:\n%s", want, logs)
+		}
+	}
+	if strings.Contains(logs, "SECRETQUERY") || strings.Contains(logs, "Bearer") {
+		t.Errorf("request log leaked a query string or header:\n%s", logs)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read while a handler goroutine is
+// still writing its request-log line (which happens just after the response
+// is sent).
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+// waitFor polls until the buffer contains want or a second passes.
+func (s *syncBuffer) waitFor(want string) {
+	for i := 0; i < 100 && !strings.Contains(s.String(), want); i++ {
+		time.Sleep(10 * time.Millisecond)
 	}
 }
