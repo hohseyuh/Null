@@ -17,6 +17,8 @@ func gitTempRepo(t *testing.T) string {
 	root := t.TempDir()
 	for _, args := range [][]string{
 		{"init", "-q"},
+		{"config", "user.name", "null-test"},
+		{"config", "user.email", "null-test@localhost"},
 		{"commit", "--allow-empty", "-q", "-m", "seed"},
 	} {
 		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
