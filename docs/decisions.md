@@ -151,6 +151,19 @@ secret (`NULL_TOKEN`) — there are still no users or roles. stdio needs no auth
 stdio in one process, because a daemon's stdin hits EOF and would shut a stdio
 server down.
 
+**OAuth state is in memory by default, persistable by opt-in.** A restart
+forgets registered clients; a client with a stale registration then hits a
+plain `400 unknown client_id` at `/authorize` (deliberately no redirect — that
+would be an open redirect) and can stay stuck until its connector is removed
+and re-added. Fine for a long-lived server, painful for a laptop restarted
+constantly, so `NULL_MCP_STATE_PATH` persists clients and tokens (one small
+`0600` JSON file, written atomically via `config.WriteJSON`). Tokens are stored
+only as SHA-256 hashes (they are 256-bit random, so the hash both validates
+and is useless to steal); authorization codes are never stored; a file written
+for another origin is discarded, since tokens are bound to the resource URI
+anyway. It is opt-in so container deployments with a read-only root are
+unchanged. Not a database — non-negotiable #1 stands.
+
 ## Deliberately not built
 
 Embeddings/RAG, users and roles, rate limiting, in-browser editing of note

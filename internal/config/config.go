@@ -50,21 +50,26 @@ func Load(path string) (File, error) {
 	return f, nil
 }
 
-// Save writes f to path atomically (temp file in the same directory, then
-// rename) with mode 0600, creating the directory 0700 if needed. A crash
-// mid-save leaves the previous file intact rather than a truncated one.
-func Save(path string, f File) error {
+// Save writes f to path atomically (see WriteJSON).
+func Save(path string, f File) error { return WriteJSON(path, f) }
+
+// WriteJSON marshals v and writes it to path atomically (temp file in the
+// same directory, then rename) with mode 0600, creating the directory 0700
+// if needed. A crash mid-write leaves the previous file intact rather than
+// a truncated one. Shared by the saved vault choice and nullmcp's OAuth
+// state, the only two things this service ever persists of its own.
+func WriteJSON(path string, v any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
+		return fmt.Errorf("create dir: %w", err)
 	}
-	b, err := json.MarshalIndent(f, "", "  ")
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".null-config-*")
+	tmp, err := os.CreateTemp(dir, ".null-*")
 	if err != nil {
-		return fmt.Errorf("write config: %w", err)
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o600); err != nil {

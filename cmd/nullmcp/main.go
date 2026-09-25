@@ -181,6 +181,9 @@ func run(log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		if p := os.Getenv("NULL_MCP_STATE_PATH"); p != "" {
+			oauth.EnablePersistence(p, log)
+		}
 		go sweepOAuthPeriodically(ctx, oauth)
 		return runHTTPTransport(ctx, server, oauth, cfg.httpAddr, cfg.token, log)
 	}

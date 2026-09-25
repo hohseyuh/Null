@@ -9,11 +9,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sync"
 	"time"
+
+	"null-service/internal/config"
 )
 
 // This file implements exactly enough of OAuth 2.1 + the MCP
@@ -34,8 +38,17 @@ import (
 // Storage is in-memory and unauthenticated-by-design where the spec
 // requires that (DCR, the metadata documents) — the credential check
 // happens exactly once, at the authorize step, same as it always has.
-// A restart drops all state; clients re-authenticate, which is normal
-// OAuth client behavior on a 401.
+//
+// By default a restart drops all state. That is fine for a long-lived
+// server but bad for one restarted often: a client holding a stale
+// registration gets a plain 400 "unknown client_id" at /authorize (no
+// redirect — see validateAuthorizeParams) and can stay stuck until its
+// connector is removed and re-added. EnablePersistence (opt-in, via
+// NULL_MCP_STATE_PATH) keeps registered clients and issued tokens across
+// restarts. Tokens are stored only as SHA-256 hashes — they are 256-bit
+// random, so the hash is enough to validate against and useless to steal
+// — and authorization codes are never stored (5-minute, single-use:
+// losing them on restart is correct).
 
 const (
 	authCodeTTL     = 5 * time.Minute
@@ -78,11 +91,17 @@ type OAuthServer struct {
 	secret   string // the shared credential — NULL_TOKEN
 	tmpl     *template.Template
 
-	mu            sync.Mutex
-	clients       map[string]oauthClient
-	codes         map[string]authCode
+	mu      sync.Mutex
+	clients map[string]oauthClient
+	codes   map[string]authCode
+	// accessTokens and refreshTokens are keyed by tokenKey(token), never
+	// by the raw token, so persisting them writes nothing usable.
 	accessTokens  map[string]issuedToken
 	refreshTokens map[string]issuedToken
+
+	statePath string       // empty: in-memory only
+	stateLog  *slog.Logger // may be nil
+	saveMu    sync.Mutex   // serializes file writes; never held with mu
 }
 
 // NewOAuthServer builds an OAuthServer. baseURL must have no trailing
@@ -104,6 +123,14 @@ func NewOAuthServer(baseURL, secret string) (*OAuthServer, error) {
 		accessTokens:  map[string]issuedToken{},
 		refreshTokens: map[string]issuedToken{},
 	}, nil
+}
+
+// tokenKey is the storage key for a token: hex SHA-256. Tokens are 256-bit
+// random, so an unsalted hash is sufficient and lets a lookup stay a map
+// access.
+func tokenKey(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // randomToken returns a 256-bit random token, hex-encoded. crypto/rand
@@ -138,12 +165,13 @@ func writeOAuthError(w http.ResponseWriter, status int, code, desc string) {
 func (o *OAuthServer) ValidateAccessToken(token string) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	at, ok := o.accessTokens[token]
+	key := tokenKey(token)
+	at, ok := o.accessTokens[key]
 	if !ok {
 		return false
 	}
 	if time.Now().After(at.expiresAt) {
-		delete(o.accessTokens, token)
+		delete(o.accessTokens, key)
 		return false
 	}
 	return at.resource == o.resource
@@ -229,6 +257,7 @@ func (o *OAuthServer) register(w http.ResponseWriter, r *http.Request) {
 	}
 	o.clients[id] = oauthClient{redirectURIs: req.RedirectURIs}
 	o.mu.Unlock()
+	o.save()
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"client_id":                  id,
@@ -470,11 +499,15 @@ func (o *OAuthServer) tokenFromRefresh(w http.ResponseWriter, r *http.Request) {
 	rt := f.Get("refresh_token")
 
 	o.mu.Lock()
-	old, ok := o.refreshTokens[rt]
+	rtKey := tokenKey(rt)
+	old, ok := o.refreshTokens[rtKey]
 	if ok {
-		delete(o.refreshTokens, rt) // rotation: this refresh token is spent regardless of outcome
+		delete(o.refreshTokens, rtKey) // rotation: this refresh token is spent regardless of outcome
 	}
 	o.mu.Unlock()
+	if ok {
+		o.save() // persist the spend now: a crash must not resurrect a rotated token
+	}
 
 	if !ok || time.Now().After(old.expiresAt) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown or expired refresh_token")
@@ -494,9 +527,10 @@ func (o *OAuthServer) issueTokenPair(w http.ResponseWriter, clientID, resource s
 	now := time.Now()
 
 	o.mu.Lock()
-	o.accessTokens[access] = issuedToken{clientID: clientID, resource: resource, expiresAt: now.Add(accessTokenTTL)}
-	o.refreshTokens[refresh] = issuedToken{clientID: clientID, resource: resource, expiresAt: now.Add(refreshTokenTTL)}
+	o.accessTokens[tokenKey(access)] = issuedToken{clientID: clientID, resource: resource, expiresAt: now.Add(accessTokenTTL)}
+	o.refreshTokens[tokenKey(refresh)] = issuedToken{clientID: clientID, resource: resource, expiresAt: now.Add(refreshTokenTTL)}
 	o.mu.Unlock()
+	o.save()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  access,
@@ -516,4 +550,109 @@ func pkceMatches(verifier, challenge string) bool {
 	sum := sha256.Sum256([]byte(verifier))
 	got := base64.RawURLEncoding.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(got), []byte(challenge)) == 1
+}
+
+// --- Optional persistence ---
+
+// persistedState is the on-disk shape. Version lets a future change refuse
+// an old file instead of misreading it. Resource pins the file to the
+// origin it was written for.
+type persistedState struct {
+	Version  int                       `json:"version"`
+	Resource string                    `json:"resource"`
+	Clients  map[string][]string       `json:"clients"` // client_id -> redirect URIs
+	Access   map[string]persistedToken `json:"access_token_hashes"`
+	Refresh  map[string]persistedToken `json:"refresh_token_hashes"`
+}
+
+type persistedToken struct {
+	ClientID  string    `json:"client_id"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// EnablePersistence loads previously saved clients and tokens from path
+// (if it exists) and turns on saving after every change. Call it once,
+// after the server's baseURL is final and before serving. A missing file
+// is a fresh start; an unreadable, corrupt or wrong-version file is logged
+// and ignored — a bad state file must never keep the server from booting.
+// A file written for a different origin is discarded: tokens are bound to
+// the resource URI, so moving hosts means a clean slate anyway. Expired
+// entries are dropped on load.
+func (o *OAuthServer) EnablePersistence(path string, log *slog.Logger) {
+	o.statePath, o.stateLog = path, log
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			o.warn("oauth state unreadable; starting empty", "path", path, "err", err)
+		}
+		return
+	}
+	var st persistedState
+	if err := json.Unmarshal(b, &st); err != nil || st.Version != 1 {
+		o.warn("oauth state not understood; starting empty", "path", path, "err", err)
+		return
+	}
+	if st.Resource != o.resource {
+		o.warn("oauth state was written for a different origin; discarding it", "path", path, "was", st.Resource, "now", o.resource)
+		return
+	}
+	now := time.Now()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for id, uris := range st.Clients {
+		o.clients[id] = oauthClient{redirectURIs: uris}
+	}
+	for k, t := range st.Access {
+		if now.Before(t.ExpiresAt) {
+			o.accessTokens[k] = issuedToken{clientID: t.ClientID, resource: o.resource, expiresAt: t.ExpiresAt}
+		}
+	}
+	for k, t := range st.Refresh {
+		if now.Before(t.ExpiresAt) {
+			o.refreshTokens[k] = issuedToken{clientID: t.ClientID, resource: o.resource, expiresAt: t.ExpiresAt}
+		}
+	}
+	if o.stateLog != nil {
+		o.stateLog.Info("oauth state restored", "clients", len(o.clients), "access", len(o.accessTokens), "refresh", len(o.refreshTokens))
+	}
+}
+
+func (o *OAuthServer) warn(msg string, args ...any) {
+	if o.stateLog != nil {
+		o.stateLog.Warn(msg, args...)
+	}
+}
+
+// save writes the current clients and tokens if persistence is on. It
+// snapshots under mu, then writes under saveMu only, so a slow disk never
+// blocks token validation. Failures are logged and swallowed: a request
+// that already succeeded must not fail because the disk did — the worst
+// case is the old restart behaviour.
+func (o *OAuthServer) save() {
+	if o.statePath == "" {
+		return
+	}
+	o.saveMu.Lock()
+	defer o.saveMu.Unlock()
+
+	st := persistedState{
+		Version: 1, Resource: o.resource,
+		Clients: map[string][]string{},
+		Access:  map[string]persistedToken{}, Refresh: map[string]persistedToken{},
+	}
+	o.mu.Lock()
+	for id, c := range o.clients {
+		st.Clients[id] = c.redirectURIs
+	}
+	for k, t := range o.accessTokens {
+		st.Access[k] = persistedToken{ClientID: t.clientID, ExpiresAt: t.expiresAt}
+	}
+	for k, t := range o.refreshTokens {
+		st.Refresh[k] = persistedToken{ClientID: t.clientID, ExpiresAt: t.expiresAt}
+	}
+	o.mu.Unlock()
+
+	if err := config.WriteJSON(o.statePath, st); err != nil {
+		o.warn("could not save oauth state", "path", o.statePath, "err", err)
+	}
 }

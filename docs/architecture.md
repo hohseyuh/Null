@@ -162,6 +162,7 @@ All environment variables. `nullapi` only unless noted.
 | `NULL_GIT_NAME` / `NULL_GIT_EMAIL` | binary name | author of server-made commits (`NULL_MCP_GIT_*` still honoured) |
 | `NULL_MCP_HTTP_ADDR` | unset | `nullmcp`: switch from stdio to Streamable HTTP (mutually exclusive) |
 | `NULL_MCP_PUBLIC_URL` | required with the above | `nullmcp`: public https origin, for OAuth discovery |
+| `NULL_MCP_STATE_PATH` | unset (in memory) | `nullmcp`: persist OAuth clients and tokens (hashed, `0600`) across restarts. Set it on any host restarted often |
 | `NULL_MCP_INSPECTOR_ADDR` | unset | `nullmcp`: dev-only tool-calling page, loopback only |
 
 **Vault resolution order:** `NULL_VAULT_PATH` → saved config file → setup mode.
@@ -173,6 +174,10 @@ All environment variables. `nullapi` only unless noted.
 - **`compose.setup.yaml`** — vault chosen in the browser; host folder
   `VAULTS_DIR` mounted at `/vaults` (the browse root); choice saved in a named
   volume; `nullmcp` is a profile started after a vault is chosen.
+- **Any host + Tailscale Funnel** (a laptop, the VPS, the VAIO) — `nullmcp` on
+  loopback, Funnel as the reverse proxy; see "Running `nullmcp` on a laptop" in
+  the README. Nothing in the code is host-specific; only `NULL_MCP_PUBLIC_URL`
+  changes when moving.
 - **Bare metal** — `deploy/nullapi.service` (systemd), or just run the binaries.
 - **Both** mount the vault **read-write** (writes are git commits made
   in-container) and need the vault to be a git repository writable by the
@@ -199,6 +204,8 @@ All environment variables. `nullapi` only unless noted.
 | Setup confined to the browse root | `TestResolveConfinesToRoot`, `TestChoosingAVaultActivatesAndPersists` |
 | Env-fixed vault can't be changed from the browser | `TestEnvLockedVaultCannotBeChangedFromTheBrowser` |
 | OAuth: PKCE required, redirect mismatch fails closed | `TestOAuthRequiresPKCE`, `TestOAuthRedirectURIMismatchFailsClosed` |
+| OAuth state survives a restart; stores no raw tokens; spent refresh tokens stay spent; other-origin state discarded | `TestOAuthStateSurvivesARestart`, `…HoldsNoUsableSecrets`, `…RotatedRefreshTokenStaysSpent…`, `…ForAnotherOriginIsDiscarded`, `TestOAuthBadStateFileNeverStopsBoot` |
+| No token or credential ever reaches a log line | `TestNoSecretsReachTheLogs` |
 | Compact JSON on the wire | `TestCompactJSONWireFormat`, `TestGraphPageAndCompactData` |
 
 ## Status and open items

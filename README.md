@@ -175,6 +175,44 @@ type the token once, in the browser. Use a *different* token from
 `NULL_UI_TOKEN`. For poking at tools by hand, `NULL_MCP_INSPECTOR_ADDR=127.0.0.1:8090`
 serves a dev-only page (no auth — loopback only).
 
+### Running `nullmcp` on a laptop (or any host), and moving hosts
+
+`nullmcp` only listens on loopback; something else makes it reachable. With
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) that is:
+
+```sh
+tailscale funnel --bg 8092        # then: tailscale funnel status  → note the exact https URL
+```
+
+Funnel serves only ports 443, 8443 and 10000, and `NULL_MCP_PUBLIC_URL` must match
+the URL you give the client **character for character, port included** — a
+mismatch breaks OAuth audience validation, not just discovery.
+
+```sh
+export NULL_VAULT_PATH=$HOME/notes                 # a git repository
+export NULL_MCP_HTTP_ADDR=127.0.0.1:8092
+export NULL_MCP_PUBLIC_URL=https://<machine>.<tailnet>.ts.net   # + :port if not 443
+export NULL_TOKEN=$(openssl rand -hex 32)          # long and random: the /authorize form is public
+export NULL_MCP_STATE_PATH=$HOME/.local/state/null/oauth.json   # see below
+go run ./cmd/nullmcp
+```
+
+Then add a custom connector in claude.ai pointing at `<NULL_MCP_PUBLIC_URL>/mcp`.
+
+**Restarts.** OAuth state (registered clients, tokens) is in memory by default, so
+a restart forgets it — and a client holding a stale registration gets a plain
+`400 unknown client_id` at `/authorize`, which can leave the connector stuck until
+you remove and re-add it. On a host you restart often, set `NULL_MCP_STATE_PATH`:
+clients and tokens are then saved (tokens only as SHA-256 hashes; mode `0600`) and
+survive restarts. Authorization codes are never saved (5 minutes, single use).
+
+**Moving hosts.** Tokens are bound to `NULL_MCP_PUBLIC_URL` + `/mcp`. To move:
+set the new `NULL_MCP_PUBLIC_URL`, then remove and re-add the connector. Tokens
+issued under the old origin are already rejected (a saved state file for a
+different origin is discarded on boot), so there is nothing to revoke by hand.
+If you move often, a named Cloudflare Tunnel would decouple the public URL from
+the machine; not worth it for a single move.
+
 There is deliberately **no push or commit tool**. The server commits on every
 write; you push with your own `git push` when you choose.
 

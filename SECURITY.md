@@ -36,6 +36,10 @@ trusted**:
   only when it sees HTTPS (directly or via `X-Forwarded-Proto`).
 - **Treat `NULL_BROWSE_ROOT` as the boundary** of what a browser session can
   point the server at. Do not set it to `/`.
+- **Exposing `nullmcp` publicly (e.g. Tailscale Funnel) puts `/authorize` and
+  `/token` on the internet.** The only credential is `NULL_TOKEN`, with no rate
+  limiting, so make it long and random (`openssl rand -hex 32`). Tokens are never
+  logged, and if you set `NULL_MCP_STATE_PATH` they are stored only as hashes.
 - The vault is mounted read-write on purpose (every write is a git commit). Keep
   it a git repository, back it up, and push it yourself — the server never
   pushes.

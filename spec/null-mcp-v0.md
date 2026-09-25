@@ -442,6 +442,17 @@ during development):
   new one, so a stolen-then-reused refresh token is a detectable replay,
   not a silent one.
 
+**State and restarts.** By default OAuth state (registered clients, access and
+refresh tokens) is in memory and a restart drops it; a client holding a stale
+`client_id` then gets a plain `400 unknown client_id` from `/authorize` (no
+redirect, by design) and may need its connector re-added. Set
+`NULL_MCP_STATE_PATH` to persist clients and tokens across restarts: one
+atomically-written `0600` JSON file, tokens stored only as SHA-256 hashes,
+authorization codes never stored, and a file written for a different
+`NULL_MCP_PUBLIC_URL` discarded on boot. A bad or unreadable file is logged and
+ignored — it never stops the server starting. Nothing in the request path logs
+a token or the shared secret (`TestNoSecretsReachTheLogs`).
+
 **`NULL_MCP_PUBLIC_URL`** must be this server's own public HTTPS origin
 (e.g. `https://host:10000`, no trailing slash) — every URL in the
 metadata documents, and the resource identifier tokens are bound to, is
