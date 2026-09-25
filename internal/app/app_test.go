@@ -192,3 +192,25 @@ func TestResolvePrecedence(t *testing.T) {
 		t.Errorf("env: %q %v", p, locked)
 	}
 }
+
+// A single-vault deployment fixes the vault by env and never mounts a
+// browse root; that must not stop the server from starting.
+func TestEnvLockedStartsWithoutABrowseRoot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	m, err := New(ctx, Options{Token: "t", BrowseRoot: "/definitely/not/mounted", EnvLocked: true, Log: log})
+	if err != nil {
+		t.Fatalf("locked manager with a missing browse root: %v", err)
+	}
+	if err := m.Start(fixtureVault); err != nil {
+		t.Fatal(err)
+	}
+	if rec := req(m, "GET", "/setup", nil, map[string]string{"Authorization": "Bearer t"}); rec.Code != 200 || !strings.Contains(rec.Body.String(), "NULL_VAULT_PATH") {
+		t.Errorf("/setup on a locked, browse-less server = %d", rec.Code)
+	}
+	// unlocked with a missing root is still a clear startup error
+	if _, err := New(ctx, Options{Token: "t", BrowseRoot: "/definitely/not/mounted", Log: log}); err == nil || !strings.Contains(err.Error(), "NULL_BROWSE_ROOT") {
+		t.Errorf("unlocked with a missing root: %v, want an actionable error", err)
+	}
+}

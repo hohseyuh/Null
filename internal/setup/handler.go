@@ -32,7 +32,8 @@ const contentSecurityPolicy = "default-src 'none'; style-src 'self'; form-action
 type Handler struct {
 	Guard   *session.Guard
 	Browser *Browser
-	// Locked means NULL_VAULT_PATH fixes the vault: the page explains
+	// Browser may be nil only when Locked: a fixed vault needs no folder
+	// browser. Locked means NULL_VAULT_PATH fixes the vault: the page explains
 	// that and offers no form. An operator's environment is not something
 	// a browser session may override.
 	Locked bool
@@ -91,7 +92,10 @@ type pageData struct {
 }
 
 func (h *Handler) page(w http.ResponseWriter, status int, d pageData) {
-	d.Current, d.Locked, d.Root, d.CSRF = h.Current(), h.Locked, h.Browser.Root(), h.csrf
+	d.Current, d.Locked, d.CSRF = h.Current(), h.Locked, h.csrf
+	if h.Browser != nil {
+		d.Root = h.Browser.Root()
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := h.tmpl.Execute(w, d); err != nil {

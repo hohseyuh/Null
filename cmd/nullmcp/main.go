@@ -90,7 +90,7 @@ func loadConfig() (config, error) {
 	// Every write commits, so the vault must already be a git repository —
 	// fail loudly at boot, never on the first write attempt at runtime.
 	if err := vault.EnsureGitRepo(cfg.vaultPath); err != nil {
-		return cfg, err
+		return cfg, fmt.Errorf("%w\nfix: run `git init && git add -A && git commit -m seed` in the vault directory on the host (and make sure the user this runs as can write to it)", err)
 	}
 	if v := os.Getenv("NULL_MAX_BODY_BYTES"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)

@@ -65,9 +65,13 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	if opts.UIToken == "" {
 		opts.UIToken = opts.Token
 	}
+	// The folder browser only matters when the vault is chosen in the
+	// browser. With NULL_VAULT_PATH fixing it, a missing browse root (the
+	// image defaults it to /vaults, which a single-vault compose file never
+	// mounts) must not stop the server from starting.
 	b, err := setup.NewBrowser(opts.BrowseRoot)
-	if err != nil {
-		return nil, err
+	if err != nil && !opts.EnvLocked {
+		return nil, fmt.Errorf("%w (choosing a vault in the browser needs a folder to browse: mount one there, point NULL_BROWSE_ROOT at one, or set NULL_VAULT_PATH to fix the vault instead)", err)
 	}
 	m := &Manager{opts: opts, rootCx: ctx, guard: session.NewGuard(opts.UIToken)}
 	m.setup, err = setup.New(setup.Handler{
