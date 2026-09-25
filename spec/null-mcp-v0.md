@@ -289,8 +289,9 @@ deliberately dropped in favor of git discipline enforced by the code:
   write attempt at runtime.
 - **Commit identity** comes from `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
   `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` set on the git subprocess
-  itself (`NULL_MCP_GIT_NAME`/`NULL_MCP_GIT_EMAIL` override the defaults,
-  `"nullmcp"`/`"nullmcp@localhost"`) — this works regardless of whether
+  itself (`NULL_GIT_NAME`/`NULL_GIT_EMAIL`, or the older `NULL_MCP_GIT_*`,
+  override the defaults `"nullmcp"`/`"nullmcp@localhost"`; `nullapi` uses
+  `"nullapi"` for its own tier commits) — this works regardless of whether
   the runtime environment has any git identity configured on disk, which
   a container typically won't.
 - **`safe.directory=*`** is passed on every git invocation. Without it, a
@@ -301,9 +302,13 @@ deliberately dropped in favor of git discipline enforced by the code:
   hardcoded, operator-chosen path this process is built to write to, not
   an arbitrary directory it wanders into.
 - **Deployment**: `compose.yaml`'s `nullmcp` service mounts the *same*
-  host vault directory as `nullapi`'s service, but without `:ro` — the
-  one write-capable mount in the whole deployment. The Docker image
-  needs `git` installed alongside `ripgrep` for this to work at all.
+  host vault directory as `nullapi`'s service, read-write in both (nullapi
+  commits the two human tier actions; see `docs/architecture.md`). The
+  vault must be a git repository the container's user can write. The
+  Docker image needs `git` installed alongside `ripgrep`.
+- **Two processes write one repo** (`nullmcp` here, `nullapi`'s Al-Mina):
+  `gitMu` serializes within a process; across processes git's own
+  `index.lock` prevents corruption and `runGit` retries briefly on it.
 
 ## Tiers
 

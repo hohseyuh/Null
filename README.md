@@ -19,8 +19,17 @@ the rules about it are enforced by the server, not requested of the model:
   write is one `git revert` away from gone;
 - the model gets **no push or commit tool at all**.
 
-Full design: [`spec/tiers.md`](spec/tiers.md). Working notes for contributors
-and coding agents: [`CLAUDE.md`](CLAUDE.md).
+## Documentation map
+
+| Read | For |
+|---|---|
+| this README | what it is, running it, configuration |
+| [`docs/architecture.md`](docs/architecture.md) | how it works, who can do what, routes, env vars, and which test enforces each guarantee |
+| [`docs/decisions.md`](docs/decisions.md) | why it is built this way, including every deliberate reversal |
+| [`spec/tiers.md`](spec/tiers.md) | the curation-tier design (canonical) |
+| [`spec/null-read-api-v0.md`](spec/null-read-api-v0.md) · [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md) | the HTTP API and MCP contracts |
+| [`CLAUDE.md`](CLAUDE.md) | rules and map for contributors and coding agents (start here if you are a model) |
+| [`SECURITY.md`](SECURITY.md) · [`CONTRIBUTING.md`](CONTRIBUTING.md) | threat model / reporting · how to contribute |
 
 ## Quick start
 

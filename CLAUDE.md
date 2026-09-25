@@ -1,153 +1,120 @@
 # CLAUDE.md — Null
 
-A markdown vault served three ways: a JSON API, an HTML renderer (with a graph view and the Al-Mina review screen), and an MCP layer that reads and writes the vault directly, one git commit per note. Every note carries a server-owned curation tier the model can lower or propose but never raise; only a human, in the renderer, raises one (`spec/tiers.md`). This file is the standing context for every session in this repo.
-
----
+Standing context for every session in this repo. Short on purpose: it holds the
+rules and the map. The detail lives in `docs/` and `spec/` — read what your
+task touches, not everything.
 
 ## What this is
 
-`Null` is a plain-markdown knowledge vault, under git. This repo is **not** the vault — it is a service that indexes the vault and presents it three ways: a JSON API (`nullapi`, read-only), an HTML renderer (same process as `nullapi`; read-only except for the two tier actions in "Tiers"), and an MCP layer (`nullmcp`) that writes — see "Writes" below.
+Null serves a **folder of markdown files (the vault, kept under git)** three
+ways from one in-memory index: a **JSON API** (for programs), a **web reader**
+(for the human owner — graph view, review screen, setup page), and an **MCP
+server** (for a language model, which can also *write* notes). This repo is the
+service, not the vault: it contains no notes except the fixture under
+`testdata/vault/`. Files are the source of truth; delete the server and nothing
+is lost.
 
-**No Obsidian.** No GUI editor is part of this system. Two write paths now: a human authors locally in whatever editor they prefer and reaches the VPS by `git push` (the server pulls or watches the working tree); an LLM through `nullmcp`'s tools writes directly to the VPS's own clone and commits there. Either way the vault stays plain files under git — nothing here invents a second source of truth.
+The organising idea: **the model is not trusted.** Every note has a server-owned
+curation *tier* (`dakhil` → `amil` → `thabit` → `asil`, meaning how far a human
+has reviewed it). The model can lower a tier or *propose* a raise; only the human
+raises one. Those rules are code that returns errors, never instructions to the
+model. "Basim" is the owner's planned personal assistant — the model that will
+call the MCP tools; he does not exist yet, so don't build for him speculatively.
 
-Files are the source of truth. This server is a lens over them and holds no state that would survive its own deletion.
+## Where to read
 
-## Two repos
-
-**`null-vault`** — the notes. Nothing but `.md` and directories. Private, backed up on its own cadence, no CI, no code.
-
-**`null-service`** — this repo. The Go server. Contains no notes, ever, except the fixture vault under `testdata/`.
-
-**They connect by bind mount, not by submodule.** The vault is cloned to a path on the VPS; each process mounts it read-write (`nullapi` for the two human tier actions, `nullmcp` for the model's writes) and is pointed at it by `NULL_VAULT_PATH`. Sync from a human's own machine is still a `git pull` in the vault clone, by cron or by a push webhook. A submodule would pin a vault commit inside the service repo, making every note you write a service-repo change — backwards.
-
-Consequence worth knowing: **`git pull` is the reindex trigger.** The fsnotify watcher (M2) sees the changed files and patches the index. No reload endpoint, no cache bust, no sync code. A pull lands many files at once, so the watcher's debounce must survive a burst of fifty changed notes without thrashing — test that.
-
-**Downstream consumer:** a personal assistant ("Basim") that reads the vault through this API. He does not exist yet. Do not build for him speculatively — but assume every response is going into an LLM context window, and size it accordingly.
+| You need | Read |
+|---|---|
+| How it works, who can do what, routes, env vars, deployment, which test enforces which rule | [`docs/architecture.md`](docs/architecture.md) |
+| Why it is this way, and every deliberate reversal (so you don't undo one) | [`docs/decisions.md`](docs/decisions.md) |
+| Tier semantics and the permission matrix (canonical) | [`spec/tiers.md`](spec/tiers.md) |
+| HTTP API contract | [`spec/null-read-api-v0.md`](spec/null-read-api-v0.md) |
+| MCP tools, OAuth, write model | [`spec/null-mcp-v0.md`](spec/null-mcp-v0.md) |
+| Running it / user-facing setup | [`README.md`](README.md) |
+| Security model and reporting | [`SECURITY.md`](SECURITY.md) |
+| The original read-only build plan (**archived, stale**) | [`docs/history/build-plan-v0.md`](docs/history/build-plan-v0.md) |
 
 ## Non-negotiables
 
-These are architectural commitments, not preferences. If a change would violate one, stop and say so rather than working around it.
+Architectural commitments, not preferences. If a change would violate one, stop
+and say so instead of working around it. Reasons are in `docs/decisions.md`.
 
-1. **Never invent a storage format.** Markdown files on disk are canonical. No database of record, no proprietary index, no note that exists only in the server. If this server is deleted, nothing is lost.
-2. **The JSON API and the indexer never write to the vault.** Reads are `O_RDONLY`. Exactly two other things write: **`nullmcp`**, deliberately (see "Writes"), and **the renderer's two human tier actions** — Al-Mina approve/deny/defer and the dakhil→amil promotion on a human's first open — which touch the tier frontmatter of one note per commit through `internal/vault/human.go` and nothing else. This was reversed twice from v0's original "read-only, full stop": first for `nullmcp`, then for Al-Mina (M7). Every write is exactly one git commit, one note at a time, never batched: that discipline, not a staging area, is what keeps a bad write cheap to undo. Consequence: `nullapi`'s vault mount is read-write, not `:ro`.
-3. **Never return a body that wasn't explicitly requested.** `/notes` and `/search` return metadata and snippets only. Bodies come from `GET /notes/{path}` alone. This is the rule that keeps a 2,000-note vault from blowing an LLM context window.
-4. **Path is the identity.** No UUIDs, no surrogate keys. `engineering/basim/soul.md` addresses that note everywhere, forever.
-5. **Never touch dotfiles or dot-directories.** `.git/` above all. Excluded from indexing and unreachable via any route.
-6. **The renderer shares the index.** It reads the same in-memory structures as the API — it does not call the API over HTTP, and it does not maintain a second parse. One process, two presentations.
-7. **The model never raises a tier, and never pushes or commits anything itself.** Every note carries a server-owned curation tier (dakhil/amil/thabit/asil — see "Tiers" below and `spec/tiers.md`); the permission matrix and R1/R2 are enforced inside `internal/vault/write.go`, never trusted to the model's instructions. No MCP tool in this codebase exposes `git commit`, `git push`, or a raw filesystem write — the server commits on write, and nothing here ever reaches a remote itself. See `spec/tiers.md`'s "One door". The functions that raise a tier live in `internal/vault/human.go` and are referenced only from `internal/render` — `TestOnlyTheRendererCanRaiseTiers` scans the source and fails if anything else (`internal/mcp` above all) touches them.
-8. **The renderer treats every note body as hostile.** A model can author note bodies, they render as raw HTML, and the renderer now performs writes. So: a strict Content-Security-Policy on every page (no inline script, no frames), a CSRF token derived from the UI token on every write form, a same-origin check on every POST, and promotion on first open counts only a genuine user navigation (cookie session + `Sec-Fetch-User: ?1` + `Sec-Fetch-Dest: document`) — an `<img>`, `<iframe>`, meta-refresh or API call planted in a note can never forge a read or an approval. Do not weaken any of these to make a UI feature easier.
-
-## Writes
-
-`nullmcp` writes note content directly (the renderer's only writes are the two human tier actions in "Tiers"; the JSON API writes nothing) to `NULL_VAULT_PATH` via `create_note`, `write_note`, and `delete_note`. There is no staging area: an earlier design routed writes through a physically separate `NULL_INBOX_PATH` directory precisely to avoid this, and that design was deliberately dropped — the safety model is git discipline instead, enforced by the code, not by physical separation:
-
-- **Every write touches exactly one file, and never shares a commit with a different note.** `create_note` → "Add `<path>`"; `write_note` → "Update `<path>`"; `delete_note` → "Delete `<path>`". `internal/vault/write.go` serializes every stage-then-commit sequence behind a mutex so two concurrent tool calls can never land in the same commit. One refinement: `write_note` amends its own immediately-preceding commit when that commit was itself an unbroken `write_note` update to the same note — editing one note ten times in a row makes one commit, not ten. The moment anything else is committed in between, the chain breaks and the next edit starts fresh. `create_note`/`delete_note` never amend and are never amend targets, no exceptions.
-- **This is the undo mechanism.** A bad write is one `git revert` of one specific commit away from gone — never entangled with anything else, because there is never more than one change per commit. There is no confirmation step beyond the tool call itself; git *is* the confirmation step, after the fact.
-- **`NULL_VAULT_PATH` must already be a git repository.** Checked once at boot (`vault.EnsureGitRepo`) — a vault that isn't a git repo fails the server's startup, never a write attempt at runtime.
-- **Nothing here ever pushes.** There is no push or commit tool exposed to the model at all — see "Tiers" below and `spec/tiers.md`'s "One door". Local commits sit on the branch; a human pushes with their own `git push` when they choose to.
-
-Full contract in `spec/null-mcp-v0.md`.
-
-## Tiers
-
-Every note carries a curation tier in frontmatter — `dakhil` (model-created, uncurated, the default), `amil` (user aware, in progress), `thabit` (curated, reviewed), `asil` (foundational, immutable to the model). Full semantics, the permission matrix, and the build order are `spec/tiers.md`, which supersedes any earlier lake/warehouse framing — there is no lake, no warehouse, no `curated` boolean; tier is a field, not a path, and a note's folder never encodes it.
-
-The mechanism, enforced entirely in `internal/vault/write.go` and `internal/vault/index.go`, never in the model's instructions:
-
-- **R1 — the model can never raise a tier.** `create_note` always lands at `dakhil` regardless of what frontmatter it's given; `tier_set` can only lower a tier (any call that would raise or hold one fails loudly, never a silent no-op); `tier_propose` only writes a proposal for a human to act on in **Al-Mina**. Promotion — including `dakhil`→`amil`, which happens automatically the first time a human reads a note in the renderer — is never reachable from `nullmcp`.
-- **R2 — editing a `thabit` note demotes it to `amil`, atomically with the edit.** `write_note` does this itself, in the same commit; `write_note`'s response says so when it fires.
-- **`asil` is write-locked at the filesystem, not just by application logic.** `internal/vault/index.go`'s `enforceAsilLock` chmods any `asil` note `0444` on every index build and reparse — belt and braces: even a bug in the write-path's own tier check would still hit a permission error from the OS.
-- **`tier`, `proposed_*`, `denied_*`, and `tier_history` are server-owned frontmatter.** A model write that includes any of them has them silently stripped and replaced with the server's own values — never an error, since the model has no legitimate reason to set them.
-
-All of `spec/tiers.md`'s build order is built (M6a–M6c, then M7). What M7 added, all in `internal/render` and `internal/vault/human.go`:
-
-- **Al-Mina** (`GET /al-mina`, `POST /al-mina/act`): the proposal queue with the model's reason inline, batch approve/deny/defer, keyboard-driven (`static/mina.js`; the page also works with plain radio buttons and no JS). `GET /mina` is the same queue as JSON for API clients. Approving a proposal to `asil` write-locks the file (0444) immediately.
-- **First-open promotion**: a human opening a `dakhil` note in the browser marks it `amil` (one commit, attributed to `nullapi`).
-- **Header on every page**: notes per tier, and Al-Mina's depth. Counts scale where colour does not.
-- **Graph view** (`GET /graph`, data at `/graph/data`): the whole vault, every tier, drawn by `static/graph.js` — the one page with JavaScript, hand-written on a canvas (a small grid-accelerated force layout; no library, no build step). Nodes are coloured by tier; an edge is only as trustworthy as its weaker end, so an edge touching a `dakhil` note is dashed.
-- **Two tokens.** `NULL_TOKEN` gates the JSON API and MCP; `NULL_UI_TOKEN` (default: the same value, with a boot warning) gates the browser UI, Al-Mina and `/setup`. Set them apart whenever a program or model holds the API token — otherwise it can log in to the UI and approve its own proposals, which is exactly what the model-cannot-forge-a-human-read design exists to prevent.
-
-## Setup (choosing the vault)
-
-`nullapi` needs no vault at boot. `NULL_VAULT_PATH` (env) fixes it and makes `/setup` read-only. Otherwise the choice saved in the config file (`NULL_CONFIG_PATH`, default `<user config dir>/null/config.json`, mode 0600, written atomically) is used, and with neither the server starts in **setup mode**: only `/login` and `/setup` respond, `/` redirects there, and API routes return 503 `not_configured`. `/setup` is a folder browser confined to `NULL_BROWSE_ROOT` (default `$HOME`) — symlinks resolved before the containment check, dot-directories refused, only directories listed — and picking a folder hot-swaps the whole app (`internal/app.Manager.Start`) without a restart and saves the choice. `nullmcp` reads the same config file at boot when `NULL_VAULT_PATH` is unset. The browse root is the only thing standing between a browser session and the filesystem; treat changes to `internal/setup/browser.go` as security-sensitive and keep its adversarial tests.
-
-## Stack
-
-- **Go 1.22+**, stdlib `net/http` with `chi` for routing.
-- **No database.** In-memory index, rebuilt on boot, incrementally updated by an `fsnotify` watcher.
-- **`ripgrep` shelled out** for full-text search. Not a library, not an inverted index, not embeddings. It is fast to five figures of notes and it can be swapped behind the response shape later.
-- `goldmark` for markdown AST (heading extraction) **and HTML rendering**, `goccy/go-yaml` for frontmatter.
-- **Renderer: Go `html/template`, server-rendered, no JS framework.** Not a separate app. No React, no Next.js, no build step, no client-side routing. One stylesheet, hand-written. JavaScript is limited to two hand-written files (`graph.js`, `mina.js`), embedded, served from `/static/`, loaded only by the pages that need them.
-- Static bearer tokens from env (`NULL_TOKEN` for the API, `NULL_UI_TOKEN` for the browser). No users, no roles — one human uses this. (`nullmcp` additionally speaks OAuth 2.1 to remote clients, wrapped around the same one secret.)
-- `modelcontextprotocol/go-sdk` for the MCP layer (`cmd/nullmcp`, `internal/mcp`) — the official Go SDK. stdio by default; Streamable HTTP (mutually exclusive, `NULL_MCP_HTTP_ADDR`) for a remote client, bearer-token-or-OAuth-gated, loopback-only, TLS by reverse proxy. `nullmcp` shares nullapi's in-memory index type but writes directly to the vault (see "Writes" above) — `git` shelled out for commits, same "not a library" taste as ripgrep for search.
-
-Chosen because Go is the current backend track and this is a small concurrent I/O service, which is exactly its shape.
+1. **Files are canonical.** No database of record, no proprietary index, no note that exists only in the server.
+2. **The JSON API and the indexer never write to the vault.** Exactly two other things do: `nullmcp` (note content, permission-checked) and the renderer's two *human* tier actions (`internal/vault/human.go`). Every write is exactly **one git commit for one note**, never batched — that, not a staging area, is what keeps a bad write cheap to undo. Consequently the vault mount is read-write and the vault must be a git repo.
+3. **Never return a body that wasn't explicitly requested.** `/notes` and `/search` return metadata and snippets; bodies come only from `GET /notes/{path}` / `get_note`. This keeps a large vault out of an LLM's context window.
+4. **Path is the identity.** No UUIDs. Every request-supplied path goes through `vault.SafeRequestPath`; the setup folder picker goes through `setup.Browser.Resolve`. Never hand-roll a path check.
+5. **Never touch dotfiles or dot-directories** (`.git/` above all): excluded from indexing, unreachable via any route.
+6. **The renderer shares the index.** It does not call the API over HTTP or keep a second parse.
+7. **The model never raises a tier and never pushes or commits.** The permission matrix, R1 (no raising), R2 (editing `thabit` demotes to `amil` atomically), the `asil` lock (also `0444` on disk) and stripping of server-owned frontmatter (`tier`, `proposed_*`, `denied_*`, `tier_history`) are enforced in `internal/vault`. No MCP tool exposes git commit/push or raw filesystem writes (`TestNoToolExposesGitOrFilesystemWrite`). Tier-raising code lives only in `internal/vault/human.go` and may be referenced only from `internal/render` (`TestOnlyTheRendererCanRaiseTiers`).
+8. **The renderer treats every note body as hostile** (a model authors them; they render as raw HTML; the renderer writes). Keep the strict CSP, the CSRF token on write forms, the same-origin check on POSTs, and promotion-on-first-open counting only a genuine user navigation. Do not weaken any of these to ease a UI feature.
+9. **Keep the API and UI credentials separable** (`NULL_TOKEN` vs `NULL_UI_TOKEN`), and keep the UI's `NULL_BROWSE_ROOT` confinement intact.
 
 ## Layout
 
 ```
-cmd/nullapi/main.go       entrypoint: env settings, boots the app.Manager
-cmd/nullmcp/main.go       MCP entrypoint, same vault/search wiring, stdio or HTTP transport
-internal/vault/           parse, index, watch — the core
-  note.go                 Note struct, frontmatter + heading extraction
-  tier.go                 Tier type, ranking, search weight, server-owned field stripping
-  index.go                in-memory index, path→Note, link graph, asil filesystem lock
-  watcher.go              fsnotify, incremental reparse
-  write.go                CreateNote/WriteNote/DeleteNote/SetTier/ProposeTier — the model's
-                           writes, straight to the vault, each its own git commit
-  human.go                MarkOpened/ApproveProposal/DenyProposal/DeferProposal — the only
-                           code that raises a tier; referenced by internal/render alone
-  mina.go                 Al-Mina queue, per-tier counts, whole-vault graph
-internal/api/             handlers, middleware, DTOs
-  routes.go               chi router
-  notes.go, search.go, graph.go, mina.go
-  auth.go, errors.go
-internal/search/          ripgrep wrapper, result parsing
-internal/session/         the token check, login cookie, same-origin check — shared by
-                           the renderer and the setup page
-internal/config/          the saved vault choice (JSON file, atomic, 0600)
-internal/setup/           /setup: confined folder browser + activate handler
-internal/app/             Manager: builds index/watcher/API/renderer for a vault and
-                           hot-swaps it; setup mode until one is chosen
-internal/render/          html/template handlers, goldmark→HTML, wikilink rewriting,
-                           Al-Mina, graph view, CSP/CSRF
-  templates/              layout, list, note, search, graph, mina
-  static/                 style.css, graph.js, mina.js. no bundler.
-internal/mcp/             MCP tools over the same in-memory index — a second
-                           presentation of the read API, and the vault's write path
-  tools.go                Tools + typed In/Out structs; no MCP SDK import, testable bare
-  server.go                wires Tools to SDK tool handlers + descriptions
-  inspector.go             dev-only HTTP page for manual tool calls, opt-in via env
-  http.go                  Streamable HTTP transport, bearer-token gated, opt-in via env
-  oauth.go                 minimal OAuth 2.1 + DCR for spec-compliant remote clients (Claude.ai)
-spec/                     the specs below — read before implementing, tiers.md above all
+cmd/nullapi/            entrypoint: env settings → app.Manager
+cmd/nullmcp/            MCP entrypoint (stdio, or Streamable HTTP + OAuth)
+internal/vault/         the core — no HTTP
+  note.go tier.go       Note/frontmatter/headings/wikilinks; Tier type, ranking, weights, server-owned keys
+  index.go watcher.go   in-memory index + backlinks, fsnotify, asil 0444 lock
+  path.go               SafeRequestPath — the one path gate
+  write.go              the MODEL's writes: Create/Write/Delete/SetTier/ProposeTier, each one git commit
+  human.go              the HUMAN's tier writes: MarkOpened/Approve/Deny/DeferProposal (render-only)
+  mina.go graph.go      Al-Mina queue, tier counts, whole-vault graph, BFS neighbourhood
+internal/api/           JSON API handlers (read-only), bearer auth
+internal/render/        web reader: templates, goldmark→HTML, Al-Mina, graph view, CSP/CSRF; static/{style.css,graph.js,mina.js}
+internal/session/       token check, login cookie, same-origin check (shared by render + setup)
+internal/setup/         /setup: confined folder browser + activate handler
+internal/config/        the saved vault choice (atomic, 0600 JSON file)
+internal/app/           Manager: builds index/watcher/API/renderer for a vault and hot-swaps it; setup mode
+internal/mcp/           MCP tools (tools.go = logic, no SDK import), server.go, http.go, oauth.go, inspector.go
+internal/search/        ripgrep wrapper, diacritic folding
+spec/                   contracts (see table above)     docs/  architecture, decisions, history
+testdata/vault/         the only notes in this repo: unicode note, frontmatter-less note, broken wikilink, a hidden dir
 ```
+
+## Stack
+
+Go (version in `go.mod`), stdlib `net/http` + `chi`; `goldmark`, `goccy/go-yaml`;
+`ripgrep` and `git` **shelled out** (not libraries); official MCP Go SDK;
+`fsnotify`. Server-rendered `html/template`, no framework, no build step; JS is
+limited to two hand-written embedded files (`graph.js`, `mina.js`). No database.
+No TLS in the binaries — a reverse proxy terminates it.
 
 ## Conventions
 
-- Errors as values, wrapped with `fmt.Errorf("%w")`. No panics outside `main`.
-- Handlers do HTTP only. All logic in `internal/vault` and `internal/search`, testable without a server.
-- Every exported func gets a doc comment stating what it does **and what it assumes**.
-- Table-driven tests. Fixture vault under `testdata/vault/` — commit it, keep it small, include a note with unicode, a note with no frontmatter, and a broken wikilink.
-- No dependency added without saying why in the commit message.
-- Concise commits, imperative mood. No emoji.
+- Errors as values, wrapped with `%w`; no panics outside `main`.
+- Handlers do HTTP only; logic lives in `internal/vault` / `internal/search` and is testable without a server.
+- Every exported func has a doc comment saying what it does **and what it assumes**.
+- Table-driven tests over the fixture vault. **Never run write paths against `testdata/vault/`** — copy it into a temp git repo (see the `gitTempRepo`/`gitVaultTools`/`writableFixture` helpers).
+- Wire format is compact JSON (`json.Marshal`, never `MarshalIndent`).
+- No dependency without saying why in the commit message. Concise, imperative commits; no emoji.
+- Before finishing: `gofmt -l .` empty, `go vet ./...`, `go test ./... -race`.
 
-## Path safety
-
-Every path from a request goes through one function before touching disk: reject `..`, reject absolute paths, reject symlinks escaping root, `filepath.Clean` then confirm the result is still under vault root. **One function, used everywhere, tested adversarially.** This is the only real attack surface.
-
-## Working style in this repo
+## Working style
 
 - Answer first, then reason. No preamble.
-- If a spec is ambiguous, say so and pick the simpler reading — do not implement both.
+- If a spec is ambiguous, say so and pick the simpler reading — don't implement both.
 - Flag scope creep before starting, not after.
-- Do not add features from the "deliberately absent" list, however easy they look.
+- Don't add anything from "Deliberately absent" however easy it looks.
 - When you disagree with a decision here, say it once with the reason, then implement what was asked.
+- Test the deployment shape you change, not just unit tests (a fixed-vault compose file once broke because only the setup layout had been run).
 
-## Deliberately absent from v0
+## Deliberately absent
 
-Writes through the JSON API, or through the renderer of any kind other than the two human tier actions (Al-Mina, first-open) — the general write path is `nullmcp` only, always one commit per note (see "Writes" above) · in-browser editing of note bodies · embeddings/RAG/chunking · users, roles, sharing beyond the static tokens · pagination beyond a cursor · rate limiting · metrics beyond request logs · any JS build step, and any JS beyond `graph.js` and `mina.js` · a push or commit tool exposed to the model — see "Tiers" above; nothing here ever reaches a remote itself · a vault picker that can name a path outside `NULL_BROWSE_ROOT`.
+Writes through the JSON API · any renderer write other than the two human tier
+actions · in-browser editing of note bodies · embeddings/RAG · users, roles,
+sharing · rate limiting · a JS build step, or JS beyond `graph.js`/`mina.js` · a
+push/commit tool for the model · anything that lets a browser session name a
+path outside `NULL_BROWSE_ROOT` · pagination beyond a cursor.
 
-The renderer is a **reader**, with one narrow, structured exception: a human raises a tier or records a denial, nothing else. It still does not grow a text box for note bodies — that's the line. A general editor is the iceberg — years of polish for something your local editor already does better.
+Each is a real future need; none is specifiable before the vault has been used
+for a while. The renderer is a **reader** with one narrow exception (a human
+raising a tier or recording a denial); a text box for note bodies is the line —
+a general editor is years of polish for something the owner's editor already does.
 
-Each is a real future need. None is specifiable before the vault has been used through this API for a fortnight.
+## Open items
+
+`epistemics.md` (the `asil` note in the *vault* that teaches a model to read the
+tiers) is not written; the remote deployment predates direct writes and tiers and
+needs redeploying. See "Status and open items" in `docs/architecture.md`.

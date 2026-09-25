@@ -1,5 +1,28 @@
 # spec/tiers.md
 
+> **Implementation status (added after the build; the design text below is unchanged).**
+> Everything in this spec is implemented except the `epistemics.md` note, which
+> belongs in the user's vault and has not been written. Where the build differs
+> from or fills a gap in the text:
+>
+> | Spec says | Built as |
+> |---|---|
+> | `GET /mina` returns the queue; Al-Mina is a renderer view | `GET /mina` (JSON, API token) and the review screen at `/al-mina` (cookie, UI token) — same query, `vault.MinaQueue` |
+> | "frontmatter history" for `tier_set` | a `tier_history` list in frontmatter (`from`, `to`, `reason`, `by`, `at`); also appended by R2 demotions and Al-Mina approvals |
+> | staleness sweep "older than a threshold" | 14 days, `NULL_MINA_STALE_DAYS` |
+> | "what changed since the last review" | boolean `changed_since_review`, not a diff |
+> | 1→2 is automatic when the user opens a note | `vault.MarkOpened`, only for a genuine user navigation (cookie session + `Sec-Fetch-User`/`Dest`), never an API call, image, prefetch or model read |
+> | "approving from Al-Mina is the only code path that raises a tier" | plus first-open promotion; both live in `internal/vault/human.go`, referenced only from `internal/render` (`TestOnlyTheRendererCanRaiseTiers`) |
+> | "one force-directed library, no framework" | none: ~200 hand-written lines (`static/graph.js`) |
+> | "no push or commit tool at all" (preferred option) | chosen; `push_vault` was removed |
+> | write-locked at the filesystem | `0444`, applied on every index build/reparse and immediately on approval to `asil` |
+>
+> Why each choice was made: [`../docs/decisions.md`](../docs/decisions.md). How it
+> fits together and which test enforces which rule:
+> [`../docs/architecture.md`](../docs/architecture.md). The "lake/warehouse" this
+> spec replaces is **not in this repository's history**; treat every mention of it
+> below as background only.
+
 Replaces the lake/warehouse split entirely. There is no `inbox/`. Curation is a **field**, not a path — a note's directory stays topical for its whole life, and its tier changes independently.
 
 ---

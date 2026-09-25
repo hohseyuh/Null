@@ -1,10 +1,19 @@
-# BUILD_PLAN.md — Null Read API v0
+# Build plan — Null Read API v0 (archived)
 
 Ordered milestones. Each ends at a state you can run and verify. Do not start one before the previous passes.
 
-Read `spec/null-read-api-v0.md` before M1 and re-read the relevant section at the start of each milestone.
+Read `../../spec/null-read-api-v0.md` before M1 and re-read the relevant section at the start of each milestone.
 
-**Status: shipped.** All of M0–M7 below are built; this file is historical from here on, not a live plan. Everything built since (the write path, OAuth, the curation-tier system) is tracked in `spec/null-mcp-v0.md` and `spec/tiers.md` instead. Note: `spec/tiers.md`'s own "Build order" section reuses the labels `M6a`/`M6b`/`M6c`/`M7` for a later, unrelated milestone sequence (the tier permission matrix and the renderer's graph view) — those are not a continuation of this file's M6/M7 below, just a label collision worth knowing about if you're reading both.
+> **ARCHIVED — do not use as a plan or a checklist.** This is the original
+> milestone plan for the *read-only* API (M0–M7), kept because it explains why
+> the early code is shaped as it is. All of it shipped, and several of its
+> premises were later **deliberately reversed**: the vault is no longer
+> read-only or mounted `:ro`, JavaScript is no longer "none", and there is a
+> curation-tier system and a setup page it never anticipated. The
+> "Verification checklist" at the bottom is therefore *stale*. For the current
+> system read [`../architecture.md`](../architecture.md) and, for why things
+> changed, [`../decisions.md`](../decisions.md). Note that `spec/tiers.md`
+> reuses the labels M6a/M6b/M6c/M7 for an unrelated, later sequence.
 
 ---
 
@@ -118,7 +127,7 @@ That log is the input to the frontmatter schema and the write policy. Both are c
 
 ---
 
-## Verification checklist
+## Verification checklist (stale — see the banner above)
 
 - [ ] No route writes to disk
 - [ ] `/notes` and `/search` never return a body field

@@ -2,9 +2,20 @@
 
 Read-only HTTP layer over the vault. Files stay the source of truth; this is a lens, not a store.
 
-**Base:** `https://null.<host>/v1`
-**Auth:** `Authorization: Bearer <token>` on every route. One static token, rotated by hand. It is your VPS — do not build OAuth for a single user.
+> **Status: implemented and current**, with additions since the first draft
+> that are marked **(tiers)** below: every note entry carries its curation
+> `tier`, `tier`/`updated_before` filters exist, search scores are tier-weighted,
+> graph nodes/edges carry tiers, and `GET /mina` exists. The API itself still
+> never writes — the write paths (MCP tools; the browser's two tier actions) are
+> documented in [`null-mcp-v0.md`](null-mcp-v0.md) and
+> [`../docs/architecture.md`](../docs/architecture.md). Tier semantics:
+> [`tiers.md`](tiers.md). The browser UI (`/`, `/n/*`, `/graph`, `/al-mina`,
+> `/setup`) is not part of this contract and uses a different credential.
+
+**Base:** `https://null.<host>/v1` (plus `/mina` at the root, see §5)
+**Auth:** `Authorization: Bearer <NULL_TOKEN>` on every route except `GET /v1/health`. One static token, rotated by hand — do not build OAuth for a single user. (The browser UI uses a separate `NULL_UI_TOKEN`; `nullmcp` speaks OAuth, wrapped around one secret.)
 **Errors:** `{ "error": "code", "detail": "..." }` with the obvious status codes.
+**Wire format:** compact JSON (`json.Marshal`, never indented), `application/json`.
 
 ---
 
@@ -29,7 +40,9 @@ List notes. Metadata only.
 |---|---|---|
 | `folder` | string | prefix filter, e.g. `engineering/` |
 | `tag` | string | repeatable; AND semantics |
+| `tier` | enum | **(tiers)** `dakhil` \| `amil` \| `thabit` \| `asil`; exact match. Unknown value → `400` |
 | `updated_after` | ISO 8601 | mtime filter |
+| `updated_before` | ISO 8601 | **(tiers)** mtime filter; with `tier=dakhil` this is the staleness sweep |
 | `limit` | int | default 50, max 200 |
 | `cursor` | string | opaque; last path of previous page |
 | `sort` | enum | `path` \| `updated` (default `updated` desc) |
@@ -42,6 +55,7 @@ List notes. Metadata only.
       "path": "engineering/basim/soul.md",
       "title": "soul",
       "tags": ["basim", "spec"],
+      "tier": "thabit",
       "frontmatter": { "status": "active", "type": "spec" },
       "updated_at": "2026-08-19T09:14:02Z",
       "size_bytes": 4820,
@@ -65,12 +79,13 @@ Fetch one note. The only route that returns a body.
 | `section` | string | heading text, e.g. `Failure modes`. Returns only that heading and its content, to the next same-or-higher heading. |
 | `include` | csv | `body` (default), `outlinks`, `backlinks` |
 
-`section` matters more than it looks. It is what lets Basim pull one clause out of a long note instead of the whole thing — and it's the same addressing scheme the write API will use later to append without clobbering. Build it now even though nothing needs it yet.
+`section` matters more than it looks. It is what lets a caller pull one clause out of a long note instead of the whole thing.
 
 **Response**
 ```json
 {
   "path": "engineering/basim/soul.md",
+  "tier": "thabit",
   "frontmatter": { "status": "active", "type": "spec", "tags": ["basim"] },
   "body": "# soul.md\n\n> The layer that does not change...",
   "headings": [
@@ -94,7 +109,7 @@ Fetch one note. The only route that returns a body.
 |---|---|---|
 | `q` | string | required; case- and diacritic-insensitive substring for now |
 | `in` | enum | `body` (default) \| `title` \| `both` |
-| `folder`, `tag` | | same as `/notes` |
+| `folder`, `tag`, `tier` | | same as `/notes` |
 | `limit` | int | default 20, max 50 |
 
 **Response — snippets, never bodies**
@@ -104,6 +119,7 @@ Fetch one note. The only route that returns a body.
     {
       "path": "philosophy/barzakh.md",
       "title": "barzakh",
+      "tier": "amil",
       "score": 0.82,
       "matches": [
         { "line": 14, "snippet": "...the interval between states, unresolved..." }
@@ -112,6 +128,8 @@ Fetch one note. The only route that returns a body.
   ]
 }
 ```
+
+**Scores are weighted by tier (tiers):** the raw score is multiplied by `dakhil` 0.4, `amil` 0.8, `thabit` 1.0, `asil` 1.0. Raw capture ranks below reviewed notes but is never excluded.
 
 **Start with `ripgrep` shelled out over the vault.** Genuinely. It is fast enough to five figures of notes and you can swap in BM25, then embeddings, behind this exact response shape without the caller noticing. Do not build a vector store in week one — you do not yet know what you need to retrieve.
 
@@ -133,19 +151,39 @@ The route that justifies markdown over a database.
 {
   "root": "engineering/basim/soul.md",
   "nodes": [
-    { "path": "engineering/basim/character.md", "title": "character", "distance": 1 }
+    { "path": "engineering/basim/character.md", "title": "character", "distance": 1, "tier": "thabit" }
   ],
   "edges": [
     {
       "from": "engineering/basim/soul.md",
       "to": "engineering/basim/character.md",
-      "context": "If character.md and this file ever disagree, this file wins."
+      "context": "If character.md and this file ever disagree, this file wins.",
+      "tier": "thabit"
     }
   ]
 }
 ```
 
+**(tiers)** Every node carries its tier; every edge carries the **lower** of its two endpoints' tiers — an edge is only as trustworthy as its weaker end. Nothing is excluded by tier.
+
 The `context` field — the line the wikilink appeared on — is the whole prize. Embedding search tells you two notes are *near*. This tells you *why they were connected*, in your own words, at the time you connected them. No vector store recovers that.
+
+---
+
+## 5. `GET /mina` **(tiers)**
+
+Al-Mina's queue as JSON, read-only: every note with an outstanding tier proposal, plus `dakhil` notes untouched for `NULL_MINA_STALE_DAYS` (default 14). Oldest first. Acting on an entry (approve / deny / defer) happens only in the browser at `/al-mina`, never through this API.
+
+```json
+{ "entries": [
+  { "path": "notes/idea.md", "title": "idea", "type": "proposal",
+    "tier": "amil", "proposed_tier": "thabit", "reason": "reviewed across 3 sessions",
+    "age_days": 4.2, "changed_since_review": false },
+  { "path": "notes/old.md", "title": "old", "type": "stale_dakhil", "tier": "dakhil", "age_days": 31 }
+] }
+```
+
+`type` is `proposal` or `stale_dakhil`. `changed_since_review` is a boolean derived from the note's `tier_history`, not a diff.
 
 ---
 
@@ -163,8 +201,8 @@ The `context` field — the line the wikilink appeared on — is the whole prize
 
 ## Deliberately absent
 
-- Writes, of any kind
-- In-browser editing (the HTML renderer is a separate, read-only concern — see BUILD_PLAN M6)
+- Writes, of any kind, through this API (writes exist elsewhere — see the status note at the top)
+- In-browser editing of note bodies
 - Embeddings, RAG, chunking
 - Users, roles, sharing
 - Anything touching dotfiles or dot-directories, `.git/` above all
